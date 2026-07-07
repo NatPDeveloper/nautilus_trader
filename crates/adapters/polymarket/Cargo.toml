@@ -74,6 +74,7 @@ dotenvy = { workspace = true }
 futures-util = { workspace = true }
 log = { workspace = true }
 rand = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
 serde = { workspace = true }
@@ -170,6 +171,16 @@ doc = false
 [[example]]
 name = "polymarket-exec-tester"
 path = "examples/node_exec_tester.rs"
+required-features = ["examples"]
+
+[[example]]
+name = "ninjitas-remote-sign-smoke"
+path = "examples/ninjitas_remote_sign_smoke.rs"
+required-features = ["examples"]
+
+[[example]]
+name = "ninjitas-remote-sign-direct-order-smoke"
+path = "examples/ninjitas_remote_sign_direct_order_smoke.rs"
 required-features = ["examples"]
 doc = false
 

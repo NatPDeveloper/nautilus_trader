@@ -27,7 +27,7 @@
 //!
 //! The builder produces signed [`PolymarketOrder`] structs ready for HTTP submission.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 
 use nautilus_core::time::get_atomic_clock_realtime;
 use nautilus_model::{
@@ -44,7 +44,7 @@ use crate::{
         enums::{PolymarketOrderSide, PolymarketOrderType, SignatureType},
     },
     http::models::PolymarketOrder,
-    signing::eip712::{OrderSigner, order_hash},
+    signing::eip712::{PolymarketOrderSigner, order_hash},
 };
 
 /// Zero `bytes32` used for the `metadata` field (reserved for future use).
@@ -57,7 +57,7 @@ pub const ZERO_BYTES32: &str = "0x0000000000000000000000000000000000000000000000
 /// produce distinct `timestamp` values (the V2 per-address uniqueness field).
 #[derive(Debug)]
 pub struct PolymarketOrderBuilder {
-    order_signer: OrderSigner,
+    order_signer: Arc<dyn PolymarketOrderSigner>,
     signer_address: String,
     maker_address: String,
     signature_type: SignatureType,
@@ -67,7 +67,7 @@ pub struct PolymarketOrderBuilder {
 impl PolymarketOrderBuilder {
     /// Creates a new [`PolymarketOrderBuilder`].
     pub fn new(
-        order_signer: OrderSigner,
+        order_signer: Arc<dyn PolymarketOrderSigner>,
         signer_address: String,
         maker_address: String,
         signature_type: SignatureType,
@@ -561,7 +561,7 @@ mod tests {
         .unwrap();
         let signer = OrderSigner::new(&pk).unwrap();
         let addr = format!("{:#x}", signer.address());
-        PolymarketOrderBuilder::new(signer, addr.clone(), addr, SignatureType::Eoa)
+        PolymarketOrderBuilder::new(Arc::new(signer), addr.clone(), addr, SignatureType::Eoa)
     }
 
     #[rstest]
@@ -630,7 +630,7 @@ mod tests {
         let signer_address = format!("{:#x}", signer.address());
         let deposit_wallet = "0x1111111111111111111111111111111111111111".to_string();
         let builder = PolymarketOrderBuilder::new(
-            signer,
+            Arc::new(signer),
             signer_address,
             deposit_wallet.clone(),
             SignatureType::Poly1271,

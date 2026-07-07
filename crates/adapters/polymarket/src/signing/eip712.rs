@@ -106,6 +106,85 @@ alloy::sol! {
     }
 }
 
+
+/// Synchronous order-signing backend used by the execution order builder.
+pub trait PolymarketOrderSigner: std::fmt::Debug + Send + Sync {
+    fn address(&self) -> Address;
+    fn sign_order(&self, order: &PolymarketOrder, neg_risk: bool) -> Result<String>;
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteEip712SignerConfig {
+    pub url: String,
+    pub auth_token: Option<String>,
+    pub signer_address: Address,
+    pub funder_address: Option<Address>,
+    pub account_id: Option<i64>,
+    pub privy_user_id: Option<String>,
+    pub strategy_id: Option<String>,
+    pub profile_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteEip712Signer {
+    config: RemoteEip712SignerConfig,
+}
+
+impl RemoteEip712Signer {
+    pub fn new(config: RemoteEip712SignerConfig) -> Result<Self> {
+        Ok(Self { config })
+    }
+
+    fn post_signature(&self, payload: serde_json::Value) -> Result<String> {
+        let url = self.config.url.clone();
+        let auth_token = self.config.auth_token.clone();
+        std::thread::spawn(move || -> Result<String> {
+            let client = reqwest::blocking::Client::builder()
+                .build()
+                .map_err(|e| Error::bad_request(format!("Failed to create remote signer client: {e}")))?;
+            let mut request = client.post(&url).json(&payload);
+            if let Some(token) = &auth_token {
+                request = request.bearer_auth(token);
+            }
+            let response = request
+                .send()
+                .map_err(|e| Error::bad_request(format!("Remote EIP-712 signing request failed: {e}")))?;
+            let status = response.status();
+            let body: serde_json::Value = response
+                .json()
+                .map_err(|e| Error::bad_request(format!("Remote EIP-712 signing response was not JSON: {e}")))?;
+            if !status.is_success() || body.get("success").and_then(serde_json::Value::as_bool) == Some(false) {
+                return Err(Error::bad_request(format!(
+                    "Remote EIP-712 signing failed with status {status}: {body}",
+                )));
+            }
+            body.get("signature")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+                .ok_or_else(|| Error::bad_request("Remote EIP-712 signing response missing signature"))
+        })
+        .join()
+        .map_err(|_| Error::bad_request("Remote EIP-712 signing thread panicked"))?
+    }
+
+    fn base_payload(&self, primary_type: &str, domain: serde_json::Value, types: serde_json::Value, message: serde_json::Value, metadata: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "purpose": "POLYMARKET_ORDER",
+            "accountId": self.config.account_id,
+            "privyUserId": self.config.privy_user_id,
+            "strategyId": self.config.strategy_id,
+            "profileId": self.config.profile_id,
+            "signerAddress": format!("{:#x}", self.config.signer_address),
+            "funderAddress": self.config.funder_address.map(|a| format!("{a:#x}")),
+            "primaryType": primary_type,
+            "domain": domain,
+            "types": types,
+            "message": message,
+            "metadata": metadata,
+        })
+    }
+}
+
 /// EIP-712 order signer for the Polymarket CTF Exchange.
 #[derive(Debug)]
 pub struct OrderSigner {
@@ -211,6 +290,159 @@ impl OrderSigner {
             alloy_primitives::hex::encode(signature.as_slice())
         ))
     }
+}
+
+impl PolymarketOrderSigner for OrderSigner {
+    fn address(&self) -> Address {
+        self.address()
+    }
+
+    fn sign_order(&self, order: &PolymarketOrder, neg_risk: bool) -> Result<String> {
+        OrderSigner::sign_order(self, order, neg_risk)
+    }
+}
+
+impl PolymarketOrderSigner for RemoteEip712Signer {
+    fn address(&self) -> Address {
+        self.config.signer_address
+    }
+
+    fn sign_order(&self, order: &PolymarketOrder, neg_risk: bool) -> Result<String> {
+        let order_signer = parse_address(&order.signer, "signer")?;
+        let order_maker = parse_address(&order.maker, "maker")?;
+        if order.signature_type == SignatureType::Poly1271 {
+            if order_signer != order_maker {
+                return Err(Error::bad_request(format!(
+                    "POLY_1271 orders require maker and signer to both be the deposit wallet, maker was {order_maker}, signer was {order_signer}",
+                )));
+            }
+        } else if order_signer != self.config.signer_address {
+            return Err(Error::bad_request(format!(
+                "Order signer {order_signer} does not match remote signer {}",
+                self.config.signer_address,
+            )));
+        }
+
+        let eip712_order = build_eip712_order(order)?;
+        let contract = exchange_contract(neg_risk);
+        if order.signature_type == SignatureType::Poly1271 {
+            let contents_hash = poly_1271_contents_hash(&eip712_order);
+            let wallet_struct_hash = poly_1271_wallet_struct_hash(contents_hash, eip712_order.signer);
+            let app_domain_separator = ctf_exchange_domain_separator(contract);
+            let signing_hash = typed_data_hash(app_domain_separator, wallet_struct_hash);
+            let signature = self.post_signature(self.base_payload(
+                "TypedDataSign",
+                serde_json::json!({
+                    "name": DOMAIN_NAME,
+                    "version": DOMAIN_VERSION,
+                    "chainId": POLYGON_CHAIN_ID,
+                    "verifyingContract": format!("{contract:#x}"),
+                }),
+                serde_json::json!({
+                    "TypedDataSign": [
+                        {"name":"contents","type":"Order"},
+                        {"name":"name","type":"string"},
+                        {"name":"version","type":"string"},
+                        {"name":"chainId","type":"uint256"},
+                        {"name":"verifyingContract","type":"address"},
+                        {"name":"salt","type":"bytes32"}
+                    ],
+                    "Order": order_type_json(),
+                }),
+                serde_json::json!({
+                    "contents": order_message_json(&eip712_order),
+                    "name": DEPOSIT_WALLET_DOMAIN_NAME,
+                    "version": DEPOSIT_WALLET_DOMAIN_VERSION,
+                    "chainId": POLYGON_CHAIN_ID,
+                    "verifyingContract": format!("{:#x}", eip712_order.signer),
+                    "salt": format!("{:#x}", B256::ZERO),
+                }),
+                serde_json::json!({
+                    "signatureType": "POLY_1271",
+                    "signingHash": format!("{signing_hash:#x}"),
+                    "order": order,
+                }),
+            ))?;
+            let signature_bytes = decode_ecdsa_signature(&signature)?;
+            let mut encoded = Vec::with_capacity(65 + 32 + 32 + ORDER_TYPE_STRING.len() + std::mem::size_of::<u16>());
+            encoded.extend_from_slice(&signature_bytes);
+            encoded.extend_from_slice(app_domain_separator.as_slice());
+            encoded.extend_from_slice(contents_hash.as_slice());
+            encoded.extend_from_slice(ORDER_TYPE_STRING.as_bytes());
+            encoded.extend_from_slice(&(ORDER_TYPE_STRING.len() as u16).to_be_bytes());
+            return Ok(format!("0x{}", alloy_primitives::hex::encode(encoded.as_slice())));
+        }
+
+        let domain = eip712_domain! {
+            name: DOMAIN_NAME,
+            version: DOMAIN_VERSION,
+            chain_id: POLYGON_CHAIN_ID,
+            verifying_contract: contract,
+        };
+        let signing_hash = eip712_order.eip712_signing_hash(&domain);
+        self.post_signature(self.base_payload(
+            "Order",
+            serde_json::json!({
+                "name": DOMAIN_NAME,
+                "version": DOMAIN_VERSION,
+                "chainId": POLYGON_CHAIN_ID,
+                "verifyingContract": format!("{contract:#x}"),
+            }),
+            serde_json::json!({ "Order": order_type_json() }),
+            order_message_json(&eip712_order),
+            serde_json::json!({
+                "signatureType": "EOA",
+                "signingHash": format!("{:#x}", B256::from(signing_hash.0)),
+                "order": order,
+            }),
+        ))
+    }
+}
+
+fn decode_ecdsa_signature(signature: &str) -> Result<[u8; 65]> {
+    let hex = signature.strip_prefix("0x").unwrap_or(signature);
+    let bytes = alloy_primitives::hex::decode(hex)
+        .map_err(|e| Error::bad_request(format!("Remote signature is not valid hex: {e}")))?;
+    if bytes.len() != 65 {
+        return Err(Error::bad_request(format!(
+            "Remote signature must be 65 bytes, got {}", bytes.len()
+        )));
+    }
+    let mut out = [0u8; 65];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+fn order_type_json() -> serde_json::Value {
+    serde_json::json!([
+        {"name":"salt","type":"uint256"},
+        {"name":"maker","type":"address"},
+        {"name":"signer","type":"address"},
+        {"name":"tokenId","type":"uint256"},
+        {"name":"makerAmount","type":"uint256"},
+        {"name":"takerAmount","type":"uint256"},
+        {"name":"side","type":"uint8"},
+        {"name":"signatureType","type":"uint8"},
+        {"name":"timestamp","type":"uint256"},
+        {"name":"metadata","type":"bytes32"},
+        {"name":"builder","type":"bytes32"}
+    ])
+}
+
+fn order_message_json(order: &Order) -> serde_json::Value {
+    serde_json::json!({
+        "salt": order.salt.to_string(),
+        "maker": format!("{:#x}", order.maker),
+        "signer": format!("{:#x}", order.signer),
+        "tokenId": order.tokenId.to_string(),
+        "makerAmount": order.makerAmount.to_string(),
+        "takerAmount": order.takerAmount.to_string(),
+        "side": order.side,
+        "signatureType": order.signatureType,
+        "timestamp": order.timestamp.to_string(),
+        "metadata": format!("{:#x}", order.metadata),
+        "builder": format!("{:#x}", order.builder),
+    })
 }
 
 /// Computes the EIP-712 signing hash used by Polymarket as the order ID.
@@ -415,6 +647,10 @@ fn order_side_to_u8(side: PolymarketOrderSide) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
     use alloy_primitives::{Signature, keccak256};
     use nautilus_core::hex;
     use rstest::rstest;
@@ -496,6 +732,73 @@ mod tests {
 
         assert!(sig.starts_with("0x"));
         assert_eq!(sig.len(), 636);
+    }
+
+    fn spawn_signature_server(signature: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf).unwrap();
+            let body = serde_json::json!({ "success": true, "signature": signature }).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body,
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        format!("http://{addr}/sign")
+    }
+
+    #[rstest]
+    fn test_remote_eip712_signer_matches_local_eoa_signature_when_backend_signs_same_payload() {
+        let local = test_signer();
+        let order = test_order();
+        let local_signature = local.sign_order(&order, false).unwrap();
+        let url = spawn_signature_server(local_signature.clone());
+        let remote = RemoteEip712Signer::new(RemoteEip712SignerConfig {
+            url,
+            auth_token: Some("test-token".to_string()),
+            signer_address: local.address(),
+            funder_address: None,
+            account_id: Some(7),
+            privy_user_id: Some("did:privy:test".to_string()),
+            strategy_id: Some("strategy-1".to_string()),
+            profile_id: Some("profile-1".to_string()),
+        })
+        .unwrap();
+
+        let remote_signature = remote.sign_order(&order, false).unwrap();
+        assert_eq!(remote_signature, local_signature);
+    }
+
+    #[rstest]
+    fn test_remote_eip712_signer_assembles_poly_1271_signature_like_local_signer() {
+        let local = test_signer();
+        let mut order = test_order();
+        let deposit_wallet = Address::from_str("0x1111111111111111111111111111111111111111").unwrap();
+        order.maker = format!("{deposit_wallet:#x}");
+        order.signer = order.maker.clone();
+        order.signature_type = SignatureType::Poly1271;
+        let local_signature = local.sign_order(&order, false).unwrap();
+        let inner_signature = format!("0x{}", &local_signature[2..132]);
+        let url = spawn_signature_server(inner_signature);
+        let remote = RemoteEip712Signer::new(RemoteEip712SignerConfig {
+            url,
+            auth_token: None,
+            signer_address: local.address(),
+            funder_address: Some(deposit_wallet),
+            account_id: Some(7),
+            privy_user_id: Some("did:privy:test".to_string()),
+            strategy_id: None,
+            profile_id: None,
+        })
+        .unwrap();
+
+        let remote_signature = remote.sign_order(&order, false).unwrap();
+        assert_eq!(remote_signature, local_signature);
     }
 
     #[rstest]

@@ -225,7 +225,7 @@ impl Debug for Credential {
 /// Ethereum address derived from the private key (lowercased with `0x` prefix).
 #[derive(Clone)]
 pub struct Secrets {
-    pub private_key: EvmPrivateKey,
+    pub private_key: Option<EvmPrivateKey>,
     pub credential: Credential,
     pub funder: Option<String>,
     pub address: String,
@@ -234,7 +234,7 @@ pub struct Secrets {
 impl Debug for Secrets {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(Secrets))
-            .field("private_key", &self.private_key)
+            .field("private_key", &self.private_key.as_ref().map(|_| "***"))
             .field("credential", &self.credential)
             .field("address", &self.address)
             .field(
@@ -292,10 +292,29 @@ impl Secrets {
         );
 
         Ok(Self {
-            private_key,
+            private_key: Some(private_key),
             credential,
             funder,
             address,
+        })
+    }
+
+    /// Resolves credentials for remote signing mode without requiring a local private key.
+    pub fn resolve_remote(
+        signer_address: String,
+        api_key: Option<String>,
+        api_secret: Option<String>,
+        passphrase: Option<String>,
+        funder: Option<String>,
+    ) -> Result<Self> {
+        let credential = Credential::resolve(api_key, api_secret, passphrase)?;
+        let funder = get_or_env_var_opt(funder.filter(|s| !s.trim().is_empty()), FUNDER_VAR)
+            .filter(|s| !s.trim().is_empty());
+        Ok(Self {
+            private_key: None,
+            credential,
+            funder,
+            address: signer_address,
         })
     }
 

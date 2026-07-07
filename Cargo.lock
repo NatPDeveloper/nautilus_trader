@@ -6594,6 +6594,7 @@ dependencies = [
  "pyo3",
  "pyo3-stub-gen",
  "rand 0.10.1",
+ "reqwest 0.13.4",
  "rstest",
  "rust_decimal",
  "rust_decimal_macros",

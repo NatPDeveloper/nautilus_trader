@@ -357,6 +357,33 @@ impl PolymarketDataClientConfig {
 
 /// Configuration for the Polymarket execution client.
 ///
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolymarketSigningBackend {
+    LocalPrivateKey,
+    RemoteEip712,
+}
+
+impl Default for PolymarketSigningBackend {
+    fn default() -> Self {
+        Self::LocalPrivateKey
+    }
+}
+
+impl PolymarketSigningBackend {
+    #[must_use]
+    pub fn from_env() -> Self {
+        match std::env::var("POLYMARKET_SIGNING_BACKEND")
+            .unwrap_or_else(|_| "local_private_key".to_string())
+            .trim()
+        {
+            "remote_eip712" | "REMOTE_EIP712" => Self::RemoteEip712,
+            _ => Self::LocalPrivateKey,
+        }
+    }
+}
+
 /// `Debug` is implemented manually to redact secrets, so it is not part of the
 /// derive list.
 #[derive(Clone, Serialize, Deserialize, bon::Builder)]
@@ -387,6 +414,23 @@ pub struct PolymarketExecClientConfig {
     pub passphrase: Option<String>,
     /// Falls back to `POLYMARKET_FUNDER` env var.
     pub funder: Option<String>,
+    /// Signing backend (`POLYMARKET_SIGNING_BACKEND`): local private key or remote EIP-712.
+    #[builder(default = PolymarketSigningBackend::from_env())]
+    pub signing_backend: PolymarketSigningBackend,
+    /// Remote EIP-712 signing endpoint (`POLYMARKET_SIGNING_URL`).
+    pub signing_url: Option<String>,
+    /// Bearer token for remote signing (`SIDECAR_INTERNAL_TOKEN` or `POLYMARKET_SIGNING_TOKEN`).
+    pub signing_auth_token: Option<String>,
+    /// Owner/signer EOA for remote signing (`POLYMARKET_SIGNER_ADDRESS`).
+    pub signer_address: Option<String>,
+    /// Optional account id sent to remote signer for authorization.
+    pub signing_account_id: Option<i64>,
+    /// Optional Privy user id sent to remote signer for authorization.
+    pub signing_privy_user_id: Option<String>,
+    /// Optional strategy id sent to remote signer for authorization.
+    pub signing_strategy_id: Option<String>,
+    /// Optional profile id sent to remote signer for authorization.
+    pub signing_profile_id: Option<String>,
     #[builder(default = SignatureType::Eoa)]
     pub signature_type: SignatureType,
     pub base_url_http: Option<String>,
@@ -418,6 +462,14 @@ impl Debug for PolymarketExecClientConfig {
             .field("api_secret", &"***")
             .field("passphrase", &"***")
             .field("funder", &self.funder)
+            .field("signing_backend", &self.signing_backend)
+            .field("signing_url", &self.signing_url)
+            .field("signing_auth_token", &"***")
+            .field("signer_address", &self.signer_address)
+            .field("signing_account_id", &self.signing_account_id)
+            .field("signing_privy_user_id", &self.signing_privy_user_id.as_ref().map(|_| "***"))
+            .field("signing_strategy_id", &self.signing_strategy_id)
+            .field("signing_profile_id", &self.signing_profile_id)
             .field("signature_type", &self.signature_type)
             .field("base_url_http", &self.base_url_http)
             .field("base_url_ws", &self.base_url_ws)
@@ -452,6 +504,31 @@ impl PolymarketExecClientConfig {
                 .api_key
                 .as_deref()
                 .is_some_and(|s| !s.trim().is_empty())
+    }
+
+    #[must_use]
+    pub fn signing_url(&self) -> String {
+        self.signing_url
+            .clone()
+            .or_else(|| std::env::var("POLYMARKET_SIGNING_URL").ok())
+            .unwrap_or_else(|| "http://127.0.0.1:3001/api/v1/internal/sidecar/sign/eip712".to_string())
+    }
+
+    #[must_use]
+    pub fn signing_auth_token(&self) -> Option<String> {
+        self.signing_auth_token
+            .clone()
+            .or_else(|| std::env::var("POLYMARKET_SIGNING_TOKEN").ok())
+            .or_else(|| std::env::var("SIDECAR_INTERNAL_TOKEN").ok())
+            .filter(|s| !s.trim().is_empty())
+    }
+
+    #[must_use]
+    pub fn signer_address(&self) -> Option<String> {
+        self.signer_address
+            .clone()
+            .or_else(|| std::env::var("POLYMARKET_SIGNER_ADDRESS").ok())
+            .filter(|s| !s.trim().is_empty())
     }
 
     #[must_use]

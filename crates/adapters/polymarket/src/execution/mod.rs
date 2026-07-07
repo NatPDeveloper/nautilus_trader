@@ -74,9 +74,9 @@ use self::{
 };
 use crate::{
     common::{consts::POLYMARKET_VENUE, credential::Secrets, enums::SignatureType},
-    config::PolymarketExecClientConfig,
+    config::{PolymarketExecClientConfig, PolymarketSigningBackend},
     http::{clob::PolymarketClobHttpClient, data_api::PolymarketDataApiHttpClient},
-    signing::eip712::OrderSigner,
+    signing::eip712::{OrderSigner, RemoteEip712Signer, RemoteEip712SignerConfig},
     websocket::client::PolymarketWebSocketClient,
 };
 
@@ -115,13 +115,27 @@ impl PolymarketExecutionClient {
         core: ExecutionClientCore,
         config: PolymarketExecClientConfig,
     ) -> anyhow::Result<Self> {
-        let secrets = Secrets::resolve(
-            config.private_key.as_deref(),
-            config.api_key.clone(),
-            config.api_secret.clone(),
-            config.passphrase.clone(),
-            config.funder.clone(),
-        )
+        let secrets = match config.signing_backend {
+            PolymarketSigningBackend::LocalPrivateKey => Secrets::resolve(
+                config.private_key.as_deref(),
+                config.api_key.clone(),
+                config.api_secret.clone(),
+                config.passphrase.clone(),
+                config.funder.clone(),
+            ),
+            PolymarketSigningBackend::RemoteEip712 => {
+                let signer_address = config
+                    .signer_address()
+                    .ok_or_else(|| anyhow::anyhow!("POLYMARKET_SIGNER_ADDRESS is required for remote_eip712 signing"))?;
+                Secrets::resolve_remote(
+                    signer_address,
+                    config.api_key.clone(),
+                    config.api_secret.clone(),
+                    config.passphrase.clone(),
+                    config.funder.clone(),
+                )
+            }
+        }
         .context("failed to resolve Polymarket credentials")?;
 
         let signer_address = secrets.address.clone();
@@ -150,8 +164,36 @@ impl PolymarketExecutionClient {
                 .map_err(|e| anyhow::anyhow!("{e}"))
                 .context("failed to create Data API HTTP client")?;
 
-        let order_signer =
-            OrderSigner::new(&secrets.private_key).context("failed to create order signer")?;
+        let order_signer: Arc<dyn crate::signing::eip712::PolymarketOrderSigner> = match config.signing_backend {
+            PolymarketSigningBackend::LocalPrivateKey => {
+                let private_key = secrets
+                    .private_key
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("POLYMARKET_PK is required for local_private_key signing"))?;
+                Arc::new(OrderSigner::new(private_key).context("failed to create order signer")?)
+            }
+            PolymarketSigningBackend::RemoteEip712 => {
+                let signer_address_parsed = signer_address
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("invalid POLYMARKET_SIGNER_ADDRESS: {e}"))?;
+                let funder_address = secrets
+                    .funder
+                    .as_deref()
+                    .map(str::parse)
+                    .transpose()
+                    .map_err(|e| anyhow::anyhow!("invalid POLYMARKET_FUNDER: {e}"))?;
+                Arc::new(RemoteEip712Signer::new(RemoteEip712SignerConfig {
+                    url: config.signing_url(),
+                    auth_token: config.signing_auth_token(),
+                    signer_address: signer_address_parsed,
+                    funder_address,
+                    account_id: config.signing_account_id,
+                    privy_user_id: config.signing_privy_user_id.clone(),
+                    strategy_id: config.signing_strategy_id.clone(),
+                    profile_id: config.signing_profile_id.clone(),
+                }).context("failed to create remote EIP-712 signer")?)
+            }
+        };
         let order_builder = Arc::new(PolymarketOrderBuilder::new(
             order_signer,
             signer_address,

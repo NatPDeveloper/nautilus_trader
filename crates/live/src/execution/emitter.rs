@@ -32,6 +32,7 @@
 use nautilus_common::{
     factories::OrderEventFactory,
     messages::{ExecutionEvent, ExecutionReport},
+    msgbus::{self, switchboard::MessagingSwitchboard},
 };
 use nautilus_core::{UUID4, UnixNanos, time::AtomicTime};
 use nautilus_model::{
@@ -431,14 +432,16 @@ impl ExecutionEventEmitter {
     }
 
     /// Emits an account state event.
+    ///
+    /// Account states are sent directly to the portfolio message bus endpoint so startup
+    /// account registration can complete before the live execution-event channel is drained.
+    /// This mirrors the Python live execution client behavior and avoids connect-time waits
+    /// depending on the async runner loop already being active.
     pub fn send_account_state(&self, state: AccountState) {
-        if let Some(sender) = &self.sender {
-            if let Err(e) = sender.send(ExecutionEvent::Account(state)) {
-                log::warn!("Failed to send account state: {e}");
-            }
-        } else {
-            log::warn!("Cannot send account state: sender not initialized");
-        }
+        msgbus::send_account_state(
+            MessagingSwitchboard::portfolio_update_account(),
+            &state,
+        );
     }
 
     /// Emits an execution report.
