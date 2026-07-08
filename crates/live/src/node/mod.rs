@@ -1528,6 +1528,42 @@ impl LiveNode {
         &mut self.exec_manager
     }
 
+    /// Dynamically creates and registers a live execution client.
+    ///
+    /// This is intended for systems that discover account-scoped credentials after
+    /// node construction (for example, per-profile sidecar execution clients).
+    /// The client is registered with the execution engine and retained by the node
+    /// so subsequent lifecycle connect/disconnect calls include it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the factory rejects the config or the execution engine
+    /// already has a client with the same ID.
+    pub fn register_exec_client(
+        &mut self,
+        name: &str,
+        factory: Box<dyn nautilus_common::factories::ExecutionClientFactory>,
+        config: Box<dyn nautilus_common::factories::ClientConfig>,
+    ) -> anyhow::Result<()> {
+        use nautilus_execution::engine::ExecutionEngine;
+
+        log::debug!("Creating dynamic execution client {name}");
+        let client = factory.create(name, config.as_ref(), self.kernel.cache().into())?;
+        let client = LiveExecutionClient::new(client);
+        let client_id = client.client_id();
+        let venue = client.venue();
+
+        self.kernel
+            .exec_engine
+            .borrow_mut()
+            .register_client(Box::new(client.clone()))?;
+        ExecutionEngine::subscribe_venue_instruments(&self.kernel.exec_engine, venue);
+        self.exec_clients.push(client);
+
+        log::info!("Registered dynamic ExecutionClient-{client_id}");
+        Ok(())
+    }
+
     /// Adds an actor to the trader.
     ///
     /// This method provides a high-level interface for adding actors to the underlying

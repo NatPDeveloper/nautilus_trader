@@ -438,10 +438,7 @@ impl ExecutionEventEmitter {
     /// This mirrors the Python live execution client behavior and avoids connect-time waits
     /// depending on the async runner loop already being active.
     pub fn send_account_state(&self, state: AccountState) {
-        msgbus::send_account_state(
-            MessagingSwitchboard::portfolio_update_account(),
-            &state,
-        );
+        msgbus::send_account_state(MessagingSwitchboard::portfolio_update_account(), &state);
     }
 
     /// Emits an execution report.
