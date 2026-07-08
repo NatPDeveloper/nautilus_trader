@@ -134,11 +134,12 @@ use config::{LiveNodeConfig, PluginConfig};
 use state::EngineConnectionStatus;
 pub use state::{LiveNodeHandle, NodeState};
 
+type MaintenanceHook = Box<dyn FnMut(&mut LiveNode) -> anyhow::Result<()> + 'static>;
+
 /// High-level abstraction for a live Nautilus system node.
 ///
 /// Provides a simplified interface for running live systems
 /// with automatic client management and lifecycle handling.
-#[derive(Debug)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.live", unsendable)
@@ -156,11 +157,28 @@ pub struct LiveNode {
     exec_clients: Vec<LiveExecutionClient>,
     external_msgbus: Option<ExternalMessageBusIngress>,
     shutdown_deadline: Option<dst::time::Instant>,
+    maintenance_hook: Option<MaintenanceHook>,
     #[cfg(feature = "plugin")]
     plugins: plugin::NodePlugins,
     #[cfg(feature = "python")]
     #[allow(dead_code)] // TODO: Under development
     python_actors: Vec<pyo3::Py<pyo3::PyAny>>,
+}
+
+impl std::fmt::Debug for LiveNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveNode")
+            .field("config", &self.config)
+            .field("handle", &self.handle)
+            .field("exec_clients", &self.exec_clients)
+            .field("external_msgbus", &self.external_msgbus)
+            .field("shutdown_deadline", &self.shutdown_deadline)
+            .field(
+                "maintenance_hook",
+                &self.maintenance_hook.as_ref().map(|_| "<hook>"),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl LiveNode {
@@ -185,6 +203,7 @@ impl LiveNode {
             exec_clients,
             external_msgbus,
             shutdown_deadline: None,
+            maintenance_hook: None,
             #[cfg(feature = "plugin")]
             plugins: plugin::NodePlugins,
             #[cfg(feature = "python")]
@@ -255,6 +274,7 @@ impl LiveNode {
             exec_clients: Vec::new(),
             external_msgbus: None,
             shutdown_deadline: None,
+            maintenance_hook: None,
             #[cfg(feature = "plugin")]
             plugins: plugin::NodePlugins,
             #[cfg(feature = "python")]
@@ -680,6 +700,18 @@ impl LiveNode {
         Ok(())
     }
 
+    /// Registers a hook that is invoked on the live node's maintenance tick while running.
+    ///
+    /// The hook runs on the node event-loop thread, making it suitable for systems
+    /// that need to mutate node-owned registries after startup without crossing the
+    /// thread-local message bus boundary.
+    pub fn set_maintenance_hook<F>(&mut self, hook: F)
+    where
+        F: FnMut(&mut LiveNode) -> anyhow::Result<()> + 'static,
+    {
+        self.maintenance_hook = Some(Box::new(hook));
+    }
+
     /// Run the live node with automatic shutdown handling.
     ///
     /// This method starts the node, runs indefinitely, and handles graceful shutdown
@@ -1055,6 +1087,13 @@ impl LiveNode {
                 // Maintenance dispatcher (before event processing to avoid
                 // starvation). See module docs for design rationale.
                 _ = maintenance_timer.tick(), if is_running => {
+                    if let Some(mut hook) = self.maintenance_hook.take() {
+                        if let Err(e) = hook(self) {
+                            log::error!("LiveNode maintenance hook failed: {e}");
+                        }
+                        self.maintenance_hook = Some(hook);
+                    }
+
                     let mut now = dst::time::Instant::now();
 
                     if recon_enabled && now >= recon_next {
