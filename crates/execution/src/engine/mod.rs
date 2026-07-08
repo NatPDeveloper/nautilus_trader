@@ -385,13 +385,12 @@ impl ExecutionEngine {
         let adapter = ExecutionClientAdapter::new(client);
 
         if let Some(existing_client_id) = self.routing_map.get(&venue) {
-            anyhow::bail!(
-                "Venue {venue} already routed to {existing_client_id}, \
-                 cannot register {client_id} for the same venue"
+            log::info!(
+                "Venue {venue} already routed to {existing_client_id}; registering {client_id} for explicit client_id routing only"
             );
+        } else {
+            self.routing_map.insert(venue, client_id);
         }
-
-        self.routing_map.insert(venue, client_id);
         log::debug!("Registered client {client_id}");
         self.clients.insert(client_id, adapter);
         Ok(())

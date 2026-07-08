@@ -83,6 +83,7 @@ use indexmap::IndexSet;
 use nautilus_common::{
     actor::{Actor, DataActor, DataActorNative},
     cache::database::CacheDatabaseAdapter,
+    clients::ExecutionClient,
     component::Component,
     enums::{Environment, LogColor},
     live::dst,
@@ -1588,9 +1589,12 @@ impl LiveNode {
 
         log::debug!("Creating dynamic execution client {name}");
         let client = factory.create(name, config.as_ref(), self.kernel.cache().into())?;
-        let client = LiveExecutionClient::new(client);
+        let mut client = LiveExecutionClient::new(client);
         let client_id = client.client_id();
         let venue = client.venue();
+        if self.state().is_running() {
+            client.start()?;
+        }
 
         self.kernel
             .exec_engine
