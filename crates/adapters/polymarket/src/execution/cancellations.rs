@@ -224,6 +224,8 @@ pub(super) fn process_cancel_result(
         .iter()
         .any(|order_id| order_id == venue_order_id_str)
     {
+        let ts_now = clock.get_time_ns();
+        emitter.emit_order_canceled(order, Some(venue_order_id), ts_now);
         return CancelResponseStatus::PerOrderResult;
     }
 
