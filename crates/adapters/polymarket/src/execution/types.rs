@@ -46,6 +46,7 @@ impl CancelOutcome {
 
 #[derive(Clone, Debug)]
 pub(crate) struct LimitOrderSubmitRequest {
+    pub(crate) client_order_id: String,
     pub(crate) token_id: String,
     pub(crate) side: OrderSide,
     pub(crate) price: Price,

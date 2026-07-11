@@ -64,6 +64,7 @@ impl PolymarketExecutionClient {
         let side = order.order_side();
         let expire_time = order.expire_time();
         let request = LimitOrderSubmitRequest {
+            client_order_id: order.client_order_id().to_string(),
             token_id,
             side,
             price,
@@ -229,6 +230,7 @@ impl PolymarketExecutionClient {
 
             match submitter
                 .submit_market_order(MarketOrderSubmitRequest {
+                    client_order_id: order.client_order_id().to_string(),
                     token_id,
                     side,
                     amount,
@@ -466,6 +468,7 @@ impl PolymarketExecutionClient {
                 .expect("validated limit order must have a price");
             batch_orders.push(BatchLimitOrderContext {
                 request: LimitOrderSubmitRequest {
+                    client_order_id: order.client_order_id().to_string(),
                     token_id: instrument.raw_symbol().to_string(),
                     side: order.order_side(),
                     price,

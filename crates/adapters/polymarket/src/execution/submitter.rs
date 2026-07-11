@@ -35,6 +35,10 @@ use rust_decimal::Decimal;
 use super::{
     order_builder::PolymarketOrderBuilder,
     parse::{adjust_market_buy_amount, calculate_market_price},
+    prepared::{
+        PreparedOrderKind, PreparedOrderRequest, PreparedPolymarketOrder,
+        take_prepared_market_order, take_prepared_order,
+    },
     types::{LimitOrderSubmitRequest, SignedLimitOrderSubmission},
 };
 use crate::{
@@ -63,6 +67,7 @@ pub(crate) struct MarketBuyFeeContext {
 
 #[derive(Debug, Clone)]
 pub(crate) struct MarketOrderSubmitRequest {
+    pub(crate) client_order_id: String,
     pub(crate) token_id: String,
     pub(crate) side: OrderSide,
     pub(crate) amount: Quantity,
@@ -146,6 +151,7 @@ impl OrderSubmitter {
         request: MarketOrderSubmitRequest,
     ) -> anyhow::Result<MarketOrderSubmitResult> {
         let MarketOrderSubmitRequest {
+            client_order_id,
             token_id,
             side,
             amount,
@@ -159,6 +165,23 @@ impl OrderSubmitter {
         let order_type = PolymarketOrderType::from_market_time_in_force(time_in_force)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let amount_dec = amount.as_decimal();
+        let prepared_request = PreparedOrderRequest {
+            client_order_id,
+            kind: PreparedOrderKind::Market,
+            token_id: token_id.clone(),
+            side,
+            price: Decimal::ZERO,
+            amount: amount_dec,
+            quote_quantity: side == OrderSide::Buy,
+            time_in_force,
+            post_only: false,
+            neg_risk,
+            tick_decimals,
+            expiration: "0".to_string(),
+        };
+        if let Some(prepared) = take_prepared_market_order(&prepared_request)? {
+            return self.post_prepared_market_order(prepared).await;
+        }
 
         let book = self
             .http_client
@@ -249,6 +272,47 @@ impl OrderSubmitter {
         })
     }
 
+    async fn post_prepared_market_order(
+        &self,
+        prepared: PreparedPolymarketOrder,
+    ) -> anyhow::Result<MarketOrderSubmitResult> {
+        let expected_venue_order_id = VenueOrderId::from(prepared.expected_venue_order_id.as_str());
+        let expected_base_qty = prepared.expected_base_quantity;
+        let order_type = prepared.order_type;
+        let poly_order = prepared.order;
+        let http_client = self.http_client.clone();
+        let response = match self
+            .retry_manager
+            .execute_with_retry(
+                "submit_prepared_market_order",
+                || {
+                    let http_client = http_client.clone();
+                    let poly_order = poly_order.clone();
+                    async move { http_client.post_order(&poly_order, order_type, false).await }
+                },
+                |error| error.is_retryable(),
+                Error::transport,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) if error.is_submit_outcome_unknown() => {
+                return Err(UnknownSubmitError {
+                    reason: error.to_string(),
+                    expected_venue_order_id,
+                    expected_base_qty: Some(expected_base_qty),
+                }
+                .into());
+            }
+            Err(error) => anyhow::bail!("{error}"),
+        };
+        Ok(MarketOrderSubmitResult {
+            response,
+            expected_base_qty,
+            expected_venue_order_id,
+        })
+    }
+
     /// Cancels a single order with retry on transient failures.
     pub(crate) async fn cancel_order(&self, venue_order_id: &str) -> HttpResult<CancelResponse> {
         let http_client = self.http_client.clone();
@@ -332,11 +396,35 @@ impl OrderSubmitter {
         &self,
         request: &LimitOrderSubmitRequest,
     ) -> anyhow::Result<SignedLimitOrderSubmission> {
+        let expiration = limit_order_expiration(request.expire_time);
+        let prepared_request = PreparedOrderRequest {
+            client_order_id: request.client_order_id.clone(),
+            kind: PreparedOrderKind::Limit,
+            token_id: request.token_id.clone(),
+            side: request.side,
+            price: request.price.as_decimal(),
+            amount: request.quantity.as_decimal(),
+            quote_quantity: false,
+            time_in_force: request.time_in_force,
+            post_only: request.post_only,
+            neg_risk: request.neg_risk,
+            tick_decimals: request.tick_decimals,
+            expiration: expiration.clone(),
+        };
+        if let Some(prepared) = take_prepared_order(&prepared_request)? {
+            return Ok(SignedLimitOrderSubmission {
+                order: prepared.order,
+                order_type: prepared.order_type,
+                post_only: prepared.request.post_only,
+                expected_venue_order_id: VenueOrderId::from(
+                    prepared.expected_venue_order_id.as_str(),
+                ),
+            });
+        }
         let order_type = PolymarketOrderType::try_from(request.time_in_force)
             .map_err(|e| anyhow::anyhow!("Unsupported time in force: {e}"))?;
         let side = PolymarketOrderSide::try_from(request.side)
             .map_err(|e| anyhow::anyhow!("Invalid order side: {e}"))?;
-        let expiration = limit_order_expiration(request.expire_time);
 
         let order = self
             .order_builder
