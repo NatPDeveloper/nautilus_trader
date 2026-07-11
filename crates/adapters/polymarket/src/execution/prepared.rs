@@ -23,6 +23,7 @@ use super::order_builder::PolymarketOrderBuilder;
 use crate::{
     common::enums::{PolymarketOrderSide, PolymarketOrderType},
     http::models::PolymarketOrder,
+    signing::eip712::order_hash,
 };
 
 const PREPARED_SCHEMA_VERSION: u32 = 1;
@@ -127,6 +128,10 @@ impl PreparedPolymarketOrder {
             );
         }
         validate_request(&self.request)?;
+        let actual_order_id = format!("{:#x}", order_hash(&self.order, self.request.neg_risk)?);
+        if actual_order_id != self.expected_venue_order_id {
+            anyhow::bail!("prepared order payload does not match its expected venue order ID");
+        }
         let expected = fingerprint(&self.request, &self.expected_venue_order_id);
         if self.fingerprint != expected {
             anyhow::bail!("prepared order fingerprint mismatch");
