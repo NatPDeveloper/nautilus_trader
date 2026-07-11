@@ -243,3 +243,77 @@ fn fingerprint(request: &PreparedOrderRequest, expected_venue_order_id: &str) ->
     );
     format!("{:#x}", keccak256(canonical.as_bytes()))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::{
+        common::{credential::EvmPrivateKey, enums::SignatureType},
+        signing::eip712::OrderSigner,
+    };
+
+    fn builder() -> PolymarketOrderBuilder {
+        let key = EvmPrivateKey::new(
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        )
+        .unwrap();
+        let signer = OrderSigner::new(&key).unwrap();
+        let address = format!("{:#x}", signer.address());
+        PolymarketOrderBuilder::new(
+            Arc::new(signer),
+            address.clone(),
+            address,
+            SignatureType::Eoa,
+        )
+    }
+
+    fn request(id: &str) -> PreparedOrderRequest {
+        PreparedOrderRequest {
+            client_order_id: id.to_string(),
+            kind: PreparedOrderKind::Limit,
+            token_id: "123".to_string(),
+            side: OrderSide::Sell,
+            price: Decimal::new(39, 2),
+            amount: Decimal::new(5, 0),
+            quote_quantity: false,
+            time_in_force: TimeInForce::Ioc,
+            post_only: false,
+            neg_risk: false,
+            tick_decimals: 2,
+            expiration: "0".to_string(),
+        }
+    }
+
+    #[test]
+    fn restored_order_round_trips_and_is_consumed_once() {
+        let prepared = PreparedPolymarketOrder::prepare(&builder(), request("PREPARED-1")).unwrap();
+        let restored = serde_json::from_str(&serde_json::to_string(&prepared).unwrap()).unwrap();
+        register_prepared_order(restored).unwrap();
+        assert!(
+            take_prepared_order(&request("PREPARED-1"))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            take_prepared_order(&request("PREPARED-1"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn changed_fields_fail_closed_without_consuming_order() {
+        let prepared = PreparedPolymarketOrder::prepare(&builder(), request("PREPARED-2")).unwrap();
+        register_prepared_order(prepared).unwrap();
+        let mut changed = request("PREPARED-2");
+        changed.amount = Decimal::new(6, 0);
+        assert!(take_prepared_order(&changed).is_err());
+        assert!(
+            take_prepared_order(&request("PREPARED-2"))
+                .unwrap()
+                .is_some()
+        );
+    }
+}
