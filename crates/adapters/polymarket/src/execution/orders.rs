@@ -65,6 +65,12 @@ impl PolymarketExecutionClient {
         let expire_time = order.expire_time();
         let request = LimitOrderSubmitRequest {
             client_order_id: order.client_order_id().to_string(),
+            account_id: self
+                .config
+                .signing_account_id
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            profile_id: self.config.signing_profile_id.clone().unwrap_or_default(),
             token_id,
             side,
             price,
@@ -202,6 +208,12 @@ impl PolymarketExecutionClient {
         let pending_submits = self.pending_submits.clone();
         let pending_cancels = self.pending_cancels.clone();
         let account_id = self.core.account_id;
+        let signing_account_id = self
+            .config
+            .signing_account_id
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        let signing_profile_id = self.config.signing_profile_id.clone().unwrap_or_default();
         let size_precision = instrument.size_precision();
         let price_precision = instrument.price_precision();
 
@@ -231,6 +243,8 @@ impl PolymarketExecutionClient {
             match submitter
                 .submit_market_order(MarketOrderSubmitRequest {
                     client_order_id: order.client_order_id().to_string(),
+                    account_id: signing_account_id,
+                    profile_id: signing_profile_id,
                     token_id,
                     side,
                     amount,
@@ -469,6 +483,12 @@ impl PolymarketExecutionClient {
             batch_orders.push(BatchLimitOrderContext {
                 request: LimitOrderSubmitRequest {
                     client_order_id: order.client_order_id().to_string(),
+                    account_id: self
+                        .config
+                        .signing_account_id
+                        .map(|value| value.to_string())
+                        .unwrap_or_default(),
+                    profile_id: self.config.signing_profile_id.clone().unwrap_or_default(),
                     token_id: instrument.raw_symbol().to_string(),
                     side: order.order_side(),
                     price,

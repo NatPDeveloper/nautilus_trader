@@ -68,6 +68,8 @@ pub(crate) struct MarketBuyFeeContext {
 #[derive(Debug, Clone)]
 pub(crate) struct MarketOrderSubmitRequest {
     pub(crate) client_order_id: String,
+    pub(crate) account_id: String,
+    pub(crate) profile_id: String,
     pub(crate) token_id: String,
     pub(crate) side: OrderSide,
     pub(crate) amount: Quantity,
@@ -152,6 +154,8 @@ impl OrderSubmitter {
     ) -> anyhow::Result<MarketOrderSubmitResult> {
         let MarketOrderSubmitRequest {
             client_order_id,
+            account_id,
+            profile_id,
             token_id,
             side,
             amount,
@@ -167,6 +171,8 @@ impl OrderSubmitter {
         let amount_dec = amount.as_decimal();
         let prepared_request = PreparedOrderRequest {
             client_order_id,
+            account_id,
+            profile_id,
             kind: PreparedOrderKind::Market,
             token_id: token_id.clone(),
             side,
@@ -402,6 +408,8 @@ impl OrderSubmitter {
         let expiration = limit_order_expiration(request.expire_time);
         let prepared_request = PreparedOrderRequest {
             client_order_id: request.client_order_id.clone(),
+            account_id: request.account_id.clone(),
+            profile_id: request.profile_id.clone(),
             kind: PreparedOrderKind::Limit,
             token_id: request.token_id.clone(),
             side: request.side,

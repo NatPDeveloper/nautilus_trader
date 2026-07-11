@@ -41,6 +41,8 @@ pub enum PreparedOrderKind {
 #[serde(rename_all = "camelCase")]
 pub struct PreparedOrderRequest {
     pub client_order_id: String,
+    pub account_id: String,
+    pub profile_id: String,
     pub kind: PreparedOrderKind,
     pub token_id: String,
     pub side: OrderSide,
@@ -211,8 +213,12 @@ pub(crate) fn take_prepared_market_order(
 }
 
 fn validate_request(request: &PreparedOrderRequest) -> anyhow::Result<()> {
-    if request.client_order_id.trim().is_empty() || request.token_id.trim().is_empty() {
-        anyhow::bail!("prepared order identity is incomplete");
+    if request.client_order_id.trim().is_empty()
+        || request.account_id.trim().is_empty()
+        || request.profile_id.trim().is_empty()
+        || request.token_id.trim().is_empty()
+    {
+        anyhow::bail!("prepared order identity or account binding is incomplete");
     }
     if request.amount <= Decimal::ZERO
         || request.price <= Decimal::ZERO
@@ -230,9 +236,11 @@ fn validate_request(request: &PreparedOrderRequest) -> anyhow::Result<()> {
 
 fn fingerprint(request: &PreparedOrderRequest, expected_venue_order_id: &str) -> String {
     let canonical = format!(
-        "{}|{}|{:?}|{}|{:?}|{}|{}|{}|{:?}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{:?}|{}|{:?}|{}|{}|{}|{:?}|{}|{}|{}|{}|{}",
         PREPARED_SCHEMA_VERSION,
         request.client_order_id,
+        request.account_id,
+        request.profile_id,
         request.kind,
         request.token_id,
         request.side,
@@ -277,6 +285,8 @@ mod tests {
     fn request(id: &str) -> PreparedOrderRequest {
         PreparedOrderRequest {
             client_order_id: id.to_string(),
+            account_id: "42".to_string(),
+            profile_id: "account:42:polymarket".to_string(),
             kind: PreparedOrderKind::Limit,
             token_id: "123".to_string(),
             side: OrderSide::Sell,
