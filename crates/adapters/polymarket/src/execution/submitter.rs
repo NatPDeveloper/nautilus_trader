@@ -36,7 +36,7 @@ use super::{
     order_builder::PolymarketOrderBuilder,
     parse::{adjust_market_buy_amount, calculate_market_price},
     prepared::{
-        PreparedOrderKind, PreparedOrderRequest, PreparedPolymarketOrder,
+        PreparedOrderKind, PreparedOrderRequest, PreparedPolymarketOrder, requires_prepared_order,
         take_prepared_market_order, take_prepared_order,
     },
     types::{LimitOrderSubmitRequest, SignedLimitOrderSubmission},
@@ -181,6 +181,9 @@ impl OrderSubmitter {
         };
         if let Some(prepared) = take_prepared_market_order(&prepared_request)? {
             return self.post_prepared_market_order(prepared).await;
+        }
+        if requires_prepared_order(&prepared_request.client_order_id) {
+            anyhow::bail!("required prepared market order is unavailable");
         }
 
         let book = self
@@ -420,6 +423,9 @@ impl OrderSubmitter {
                     prepared.expected_venue_order_id.as_str(),
                 ),
             });
+        }
+        if requires_prepared_order(&prepared_request.client_order_id) {
+            anyhow::bail!("required prepared limit order is unavailable");
         }
         let order_type = PolymarketOrderType::try_from(request.time_in_force)
             .map_err(|e| anyhow::anyhow!("Unsupported time in force: {e}"))?;

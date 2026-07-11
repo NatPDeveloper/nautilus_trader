@@ -156,6 +156,11 @@ pub fn register_prepared_order(prepared: PreparedPolymarketOrder) -> anyhow::Res
     Ok(())
 }
 
+pub(crate) fn requires_prepared_order(client_order_id: &str) -> bool {
+    client_order_id.starts_with("strategy:")
+        && (client_order_id.contains(":stop:") || client_order_id.contains(":tpsl:"))
+}
+
 pub fn discard_prepared_order(client_order_id: &str) -> bool {
     PREPARED
         .lock()
@@ -284,6 +289,14 @@ mod tests {
             tick_decimals: 2,
             expiration: "0".to_string(),
         }
+    }
+
+    #[test]
+    fn strategy_stop_and_tpsl_ids_require_preparation() {
+        assert!(requires_prepared_order("strategy:one:stop:entry"));
+        assert!(requires_prepared_order("strategy:one:tpsl:tp"));
+        assert!(!requires_prepared_order("strategy:one:ladder:0"));
+        assert!(!requires_prepared_order("direct-order"));
     }
 
     #[test]
