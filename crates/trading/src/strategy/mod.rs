@@ -46,7 +46,7 @@ use nautilus_model::{
     },
     identifiers::{
         AccountId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, PositionId, StrategyId,
-        TraderId,
+        TraderId, VenueOrderId,
     },
     orders::{
         LIMIT_ORDER_TYPES, Order, OrderAny, OrderCore, OrderError, OrderList, STOP_ORDER_TYPES,
@@ -694,6 +694,47 @@ pub trait Strategy: DataActor {
             self.cancel_gtd_expiry(&order.client_order_id());
         }
 
+        Ok(())
+    }
+
+    /// Cancels an order from an authoritative exact identity when the local cache was not
+    /// recovered. This path intentionally supports only direct execution-client routing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the strategy is not registered.
+    fn cancel_order_by_identity(
+        &mut self,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+        venue_order_id: VenueOrderId,
+        client_id: ClientId,
+        params: Option<Params>,
+    ) -> anyhow::Result<()>
+    where
+        Self: StrategyNative,
+    {
+        let (trader_id, strategy_id, ts_init) = {
+            let core = StrategyNative::strategy_core_mut(self);
+            (
+                registered_trader_id(core)?,
+                StrategyId::from(core.actor_id().inner().as_str()),
+                core.clock_mut().timestamp_ns(),
+            )
+        };
+        let command = CancelOrder::new(
+            trader_id,
+            Some(client_id),
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            Some(venue_order_id),
+            UUID4::new(),
+            ts_init,
+            params.filter(|params| !params.is_empty()),
+            None,
+        );
+        send_exec_command(TradingCommand::CancelOrder(command));
         Ok(())
     }
 

@@ -33,7 +33,7 @@ use super::{
     parse::{compute_commission, instrument_fee_exponent, instrument_taker_fee},
     reports::fetch_collateral_balance_pusd,
     responses::{
-        check_fok_status, emit_market_order_submitted, handle_batch_order_responses,
+        check_immediate_order_status, emit_market_order_submitted, handle_batch_order_responses,
         handle_order_response, handle_single_order_response, handle_unknown_submit_result,
         reject_submit_order,
     },
@@ -107,6 +107,13 @@ impl PolymarketExecutionClient {
             let expected_venue_order_id = submission.expected_venue_order_id;
             match submitter.post_limit_order_submission(submission).await {
                 Ok(response) => {
+                    let confirmation_order_id = response
+                        .order_id
+                        .as_ref()
+                        .filter(|_| {
+                            response.success && matches!(tif, TimeInForce::Ioc | TimeInForce::Fok)
+                        })
+                        .cloned();
                     if let Some((order_id_str, venue_order_id)) = handle_order_response(
                         Ok(response),
                         &order,
@@ -126,6 +133,20 @@ impl PolymarketExecutionClient {
                             venue_order_id,
                             &emitter,
                             &pending_cancels,
+                            clock,
+                        )
+                        .await;
+                    }
+                    if let Some(order_id) = confirmation_order_id {
+                        check_immediate_order_status(
+                            &submitter,
+                            &order_id,
+                            &order,
+                            &fill_tracker,
+                            &emitter,
+                            account_id,
+                            size_precision,
+                            price_precision,
                             clock,
                         )
                         .await;
@@ -281,11 +302,14 @@ impl PolymarketExecutionClient {
                         }
                     }
 
-                    let fok_order_id = result
+                    let confirmation_order_id = result
                         .response
                         .order_id
                         .as_ref()
-                        .filter(|_| result.response.success && time_in_force == TimeInForce::Fok)
+                        .filter(|_| {
+                            result.response.success
+                                && matches!(time_in_force, TimeInForce::Ioc | TimeInForce::Fok)
+                        })
                         .cloned();
 
                     if let Some((order_id_str, venue_order_id)) = handle_order_response(
@@ -312,8 +336,8 @@ impl PolymarketExecutionClient {
                         .await;
                     }
 
-                    if let Some(order_id) = fok_order_id {
-                        check_fok_status(
+                    if let Some(order_id) = confirmation_order_id {
+                        check_immediate_order_status(
                             &submitter,
                             &order_id,
                             &order,

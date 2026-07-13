@@ -82,8 +82,9 @@ impl OrderFillTrackerMap {
             .is_some()
     }
 
-    /// Returns true if the order has received any fills or been removed (settled).
-    pub(crate) fn has_fills_or_settled(&self, venue_order_id: &VenueOrderId) -> bool {
+    /// Returns true only when WebSocket lifecycle evidence is terminal. Partial fills must not
+    /// suppress exact IOC/FOK terminal confirmation.
+    pub(crate) fn has_terminal_fill_or_settled(&self, venue_order_id: &VenueOrderId) -> bool {
         match self
             .inner
             .lock()
@@ -91,8 +92,8 @@ impl OrderFillTrackerMap {
             .orders
             .get(venue_order_id)
         {
-            Some(s) => s.cumulative_filled > 0.0,
-            None => true, // Removed = already settled
+            Some(state) => state.submitted_qty.as_f64() - state.cumulative_filled < 1e-9,
+            None => true,
         }
     }
 
@@ -611,6 +612,24 @@ mod tests {
             2,
         );
         assert!(tracker.contains(&vid));
+    }
+
+    #[rstest]
+    fn partial_fill_does_not_suppress_terminal_confirmation() {
+        let tracker = OrderFillTrackerMap::new();
+        let vid = VenueOrderId::from("order-partial");
+        tracker.register(
+            vid,
+            Quantity::from("100"),
+            OrderSide::Buy,
+            InstrumentId::from("TEST.POLYMARKET"),
+            6,
+            2,
+        );
+        tracker.record_fill(&vid, 25.0, 0.5, UnixNanos::from(1_000u64));
+        assert!(!tracker.has_terminal_fill_or_settled(&vid));
+        tracker.record_fill(&vid, 75.0, 0.5, UnixNanos::from(2_000u64));
+        assert!(tracker.has_terminal_fill_or_settled(&vid));
     }
 
     // snap_fill_qty is overfill-only. Underfill is preserved so partial fills

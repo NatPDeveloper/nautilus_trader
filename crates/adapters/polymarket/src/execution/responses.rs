@@ -18,14 +18,14 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use nautilus_common::live::get_runtime;
 use nautilus_core::{MUTEX_POISONED, UUID4, time::AtomicTime};
 use nautilus_live::ExecutionEventEmitter;
 use nautilus_model::{
-    enums::{OrderSide, OrderStatus, OrderType, TimeInForce},
+    enums::{OrderSide, OrderStatus, TimeInForce},
     events::{OrderEventAny, OrderUpdated},
     identifiers::{AccountId, VenueOrderId},
     orders::{Order, OrderAny},
@@ -44,7 +44,7 @@ use super::{
     submitter::OrderSubmitter,
     types::BatchLimitOrderContext,
 };
-use crate::http::query::OrderResponse;
+use crate::http::{models::PolymarketOpenOrder, query::OrderResponse};
 
 #[expect(clippy::too_many_arguments)]
 pub(super) async fn handle_batch_order_responses(
@@ -658,8 +658,17 @@ fn emit_drained_order_report(
     }
 }
 
+const IOC_CONFIRMATION_DELAYS: [Duration; 5] = [
+    Duration::from_millis(100),
+    Duration::from_millis(200),
+    Duration::from_millis(400),
+    Duration::from_millis(800),
+    Duration::from_millis(1_600),
+];
+const FOK_CONFIRMATION_DELAYS: [Duration; 1] = [Duration::from_secs(5)];
+
 #[expect(clippy::too_many_arguments)]
-pub(super) async fn check_fok_status(
+pub(super) async fn check_immediate_order_status(
     submitter: &OrderSubmitter,
     order_id: &str,
     order: &OrderAny,
@@ -670,91 +679,204 @@ pub(super) async fn check_fok_status(
     price_precision: u8,
     clock: &'static AtomicTime,
 ) {
-    const FOK_CHECK_DELAY: Duration = Duration::from_secs(5);
+    let (delays, kind): (&[Duration], &str) = match order.time_in_force() {
+        TimeInForce::Ioc => (&IOC_CONFIRMATION_DELAYS, "IOC"),
+        TimeInForce::Fok => (&FOK_CONFIRMATION_DELAYS, "FOK"),
+        _ => return,
+    };
+    check_terminal_status_with_backoff(
+        submitter,
+        order_id,
+        order,
+        fill_tracker,
+        emitter,
+        account_id,
+        size_precision,
+        price_precision,
+        clock,
+        delays,
+        kind,
+    )
+    .await;
+}
 
-    tokio::time::sleep(FOK_CHECK_DELAY).await;
-
+#[expect(clippy::too_many_arguments)]
+async fn check_terminal_status_with_backoff(
+    submitter: &OrderSubmitter,
+    order_id: &str,
+    order: &OrderAny,
+    fill_tracker: &Arc<OrderFillTrackerMap>,
+    emitter: &ExecutionEventEmitter,
+    account_id: AccountId,
+    size_precision: u8,
+    price_precision: u8,
+    clock: &'static AtomicTime,
+    delays: &[Duration],
+    confirmation_kind: &str,
+) {
     let venue_order_id = VenueOrderId::from(order_id);
-    if fill_tracker.has_fills_or_settled(&venue_order_id) {
+    let started = Instant::now();
+
+    for (attempt, delay) in delays.iter().enumerate() {
+        tokio::time::sleep(*delay).await;
+        if fill_tracker.has_terminal_fill_or_settled(&venue_order_id) {
+            log::info!(
+                "stop_order.confirmation source=websocket kind={} client_order_id={} venue_order_id={} attempt={} acceptance_to_terminal_ms={}",
+                confirmation_kind,
+                order.client_order_id(),
+                venue_order_id,
+                attempt + 1,
+                started.elapsed().as_millis(),
+            );
+            return;
+        }
+
+        let venue_order = match submitter.get_order(order_id).await {
+            Ok(Some(order)) => order,
+            Ok(None) => continue,
+            Err(error) => {
+                log::warn!(
+                    "stop_order.confirmation_check_failed kind={} client_order_id={} venue_order_id={} attempt={} error={}",
+                    confirmation_kind,
+                    order.client_order_id(),
+                    venue_order_id,
+                    attempt + 1,
+                    error,
+                );
+                continue;
+            }
+        };
+        let status = OrderStatus::from(venue_order.status);
+        // Fill evidence arriving over the user stream wins a REST terminal race. Recheck after
+        // the network await and before projecting the fallback result.
+        match confirmation_decision(
+            fill_tracker.has_terminal_fill_or_settled(&venue_order_id),
+            status,
+        ) {
+            ConfirmationDecision::Continue => continue,
+            ConfirmationDecision::WebsocketWon => {
+                log::info!(
+                    "stop_order.confirmation source=websocket kind={} client_order_id={} venue_order_id={} attempt={} acceptance_to_terminal_ms={}",
+                    confirmation_kind,
+                    order.client_order_id(),
+                    venue_order_id,
+                    attempt + 1,
+                    started.elapsed().as_millis(),
+                );
+                return;
+            }
+            ConfirmationDecision::ProjectRest => {}
+        }
+
+        let ts_now = clock.get_time_ns();
+        send_terminal_confirmation_report(
+            emitter,
+            build_rest_confirmation_report(
+                &venue_order,
+                order,
+                account_id,
+                status,
+                size_precision,
+                price_precision,
+                ts_now,
+            ),
+        );
+        log::info!(
+            "stop_order.confirmation source=rest_fallback kind={} client_order_id={} venue_order_id={} status={:?} attempt={} acceptance_to_terminal_ms={}",
+            confirmation_kind,
+            order.client_order_id(),
+            venue_order_id,
+            status,
+            attempt + 1,
+            started.elapsed().as_millis(),
+        );
         return;
     }
 
-    log::warn!("FOK order {order_id} unresolved after 5s, checking REST status");
+    log::warn!(
+        "stop_order.confirmation_timeout kind={} client_order_id={} venue_order_id={} attempts={} elapsed_ms={}",
+        confirmation_kind,
+        order.client_order_id(),
+        venue_order_id,
+        delays.len(),
+        started.elapsed().as_millis(),
+    );
+}
 
-    let venue_order = match submitter.get_order(order_id).await {
-        Ok(Some(o)) => o,
-        Ok(None) => {
-            log::debug!("FOK order {order_id} not found (empty response), WS will reconcile");
-            return;
-        }
-        Err(e) => {
-            log::warn!("FOK status check failed for {order_id}: {e}");
-            return;
-        }
-    };
+#[expect(clippy::too_many_arguments)]
+pub(super) fn send_terminal_confirmation_report(
+    emitter: &ExecutionEventEmitter,
+    report: OrderStatusReport,
+) {
+    if !report.filled_qty.is_zero()
+        && matches!(
+            report.order_status,
+            OrderStatus::Canceled | OrderStatus::Expired | OrderStatus::Rejected
+        )
+    {
+        let mut fill_report = report.clone();
+        fill_report.order_status = OrderStatus::PartiallyFilled;
+        emitter.send_order_status_report(fill_report);
+    }
+    emitter.send_order_status_report(report);
+}
 
-    let order_status = OrderStatus::from(venue_order.status);
-    let ts_now = clock.get_time_ns();
+fn build_rest_confirmation_report(
+    venue_order: &PolymarketOpenOrder,
+    order: &OrderAny,
+    account_id: AccountId,
+    status: OrderStatus,
+    size_precision: u8,
+    price_precision: u8,
+    ts_now: nautilus_core::UnixNanos,
+) -> OrderStatusReport {
+    let mut report = OrderStatusReport::new(
+        account_id,
+        order.instrument_id(),
+        Some(order.client_order_id()),
+        VenueOrderId::from(venue_order.id.as_str()),
+        order.order_side(),
+        order.order_type(),
+        order.time_in_force(),
+        status,
+        Quantity::new(
+            venue_order.original_size.to_string().parse().unwrap_or(0.0),
+            size_precision,
+        ),
+        Quantity::new(
+            venue_order.size_matched.to_string().parse().unwrap_or(0.0),
+            size_precision,
+        ),
+        ts_now,
+        ts_now,
+        ts_now,
+        None,
+    );
+    report.price = Some(Price::new(
+        venue_order.price.to_string().parse().unwrap_or(0.0),
+        price_precision,
+    ));
+    report
+}
 
-    match order_status {
-        OrderStatus::Rejected => {
-            log::debug!("FOK order {order_id} resolved via REST as Rejected");
-            emitter.emit_order_rejected(order, "FOK order unfilled", ts_now, false);
-        }
-        OrderStatus::Canceled => {
-            log::debug!("FOK order {order_id} resolved via REST as Canceled");
-            emitter.emit_order_canceled(order, Some(venue_order_id), ts_now);
-        }
-        OrderStatus::Expired => {
-            log::debug!("FOK order {order_id} resolved via REST as Expired");
-            emitter.emit_order_expired(order, Some(venue_order_id), ts_now);
-        }
-        OrderStatus::Filled => {
-            // The venue reports Filled but no fills reached the tracker. Build a report so the
-            // engine reconciles from venue state rather than synthesizing fabricated fills.
-            let quantity = Quantity::new(
-                venue_order
-                    .original_size
-                    .to_string()
-                    .parse::<f64>()
-                    .unwrap_or(0.0),
-                size_precision,
-            );
-            let filled_qty = Quantity::new(
-                venue_order
-                    .size_matched
-                    .to_string()
-                    .parse::<f64>()
-                    .unwrap_or(0.0),
-                size_precision,
-            );
-            let price = Price::new(
-                venue_order.price.to_string().parse::<f64>().unwrap_or(0.0),
-                price_precision,
-            );
+#[derive(Debug, PartialEq, Eq)]
+enum ConfirmationDecision {
+    Continue,
+    WebsocketWon,
+    ProjectRest,
+}
 
-            let mut report = OrderStatusReport::new(
-                account_id,
-                order.instrument_id(),
-                Some(order.client_order_id()),
-                venue_order_id,
-                order.order_side(),
-                OrderType::Limit,
-                TimeInForce::Fok,
-                order_status,
-                quantity,
-                filled_qty,
-                ts_now,
-                ts_now,
-                ts_now,
-                None,
-            );
-            report.price = Some(price);
-
-            log::debug!("FOK order {order_id} resolved via REST as Filled; reconciling via report");
-            emitter.send_order_status_report(report);
-        }
-        _ => {}
+fn confirmation_decision(ws_settled: bool, status: OrderStatus) -> ConfirmationDecision {
+    if ws_settled {
+        return ConfirmationDecision::WebsocketWon;
+    }
+    if matches!(
+        status,
+        OrderStatus::Filled | OrderStatus::Canceled | OrderStatus::Rejected | OrderStatus::Expired
+    ) {
+        ConfirmationDecision::ProjectRest
+    } else {
+        ConfirmationDecision::Continue
     }
 }
 
@@ -763,7 +885,7 @@ mod tests {
     use nautilus_common::messages::ExecutionEvent;
     use nautilus_core::{UnixNanos, collections::AtomicMap};
     use nautilus_model::{
-        enums::{AccountType, LiquiditySide},
+        enums::{AccountType, LiquiditySide, OrderType, TimeInForce},
         identifiers::{ClientOrderId, InstrumentId, StrategyId, TradeId, TraderId},
         instruments::{Instrument, InstrumentAny},
         orders::{LimitOrder, MarketOrder, Order, stubs::TestOrderEventStubs},
@@ -775,8 +897,8 @@ mod tests {
     use super::*;
     use crate::{
         common::enums::{
-            PolymarketEventType, PolymarketLiquiditySide, PolymarketOrderSide, PolymarketOutcome,
-            PolymarketTradeStatus,
+            PolymarketEventType, PolymarketLiquiditySide, PolymarketOrderSide,
+            PolymarketOrderStatus, PolymarketOutcome, PolymarketTradeStatus,
         },
         http::{
             models::GammaMarket,
@@ -787,6 +909,91 @@ mod tests {
             messages::{PolymarketUserOrder, PolymarketUserTrade, UserWsMessage},
         },
     };
+
+    #[rstest]
+    #[case(OrderStatus::Filled)]
+    #[case(OrderStatus::Canceled)]
+    #[case(OrderStatus::Rejected)]
+    #[case(OrderStatus::Expired)]
+    fn terminal_ioc_status_projects_rest_confirmation(#[case] status: OrderStatus) {
+        assert_eq!(
+            confirmation_decision(false, status),
+            ConfirmationDecision::ProjectRest
+        );
+    }
+
+    #[rstest]
+    #[case(OrderStatus::Accepted)]
+    #[case(OrderStatus::Submitted)]
+    #[case(OrderStatus::PartiallyFilled)]
+    fn nonterminal_ioc_status_continues_polling(#[case] status: OrderStatus) {
+        assert_eq!(
+            confirmation_decision(false, status),
+            ConfirmationDecision::Continue
+        );
+    }
+
+    #[rstest]
+    fn websocket_settlement_wins_rest_terminal_race() {
+        assert_eq!(
+            confirmation_decision(true, OrderStatus::Filled),
+            ConfirmationDecision::WebsocketWon
+        );
+        assert_eq!(
+            confirmation_decision(true, OrderStatus::Canceled),
+            ConfirmationDecision::WebsocketWon
+        );
+    }
+
+    #[rstest]
+    fn ioc_confirmation_backoff_is_bounded() {
+        assert_eq!(IOC_CONFIRMATION_DELAYS.len(), 5);
+        assert_eq!(
+            IOC_CONFIRMATION_DELAYS.iter().sum::<Duration>(),
+            Duration::from_millis(3_100)
+        );
+    }
+
+    #[rstest]
+    fn full_fill_confirmation_preserves_exact_order_identity() {
+        let venue_order: PolymarketOpenOrder = load("http_open_order_sell_fok.json");
+        let order = test_limit_order("strategy:stop-1:stop:entry", test_instrument().id());
+        let report = build_rest_confirmation_report(
+            &venue_order,
+            &order,
+            AccountId::from("POLY-001"),
+            OrderStatus::Filled,
+            2,
+            4,
+            UnixNanos::from(1),
+        );
+
+        assert_eq!(report.order_status, OrderStatus::Filled);
+        assert_eq!(report.client_order_id, Some(order.client_order_id()));
+        assert_eq!(report.venue_order_id.as_str(), venue_order.id);
+        assert_eq!(report.filled_qty.as_f64(), 50.0);
+    }
+
+    #[rstest]
+    fn canceled_ioc_confirmation_preserves_unfilled_quantity() {
+        let mut venue_order: PolymarketOpenOrder = load("http_open_order_sell_fok.json");
+        venue_order.status = PolymarketOrderStatus::Canceled;
+        venue_order.size_matched = Decimal::ZERO;
+        let order = test_limit_order("strategy:stop-2:stop:entry", test_instrument().id());
+        let report = build_rest_confirmation_report(
+            &venue_order,
+            &order,
+            AccountId::from("POLY-001"),
+            OrderStatus::Canceled,
+            2,
+            4,
+            UnixNanos::from(1),
+        );
+
+        assert_eq!(report.order_status, OrderStatus::Canceled);
+        assert_eq!(report.client_order_id, Some(order.client_order_id()));
+        assert_eq!(report.filled_qty.as_f64(), 0.0);
+    }
 
     fn load<T: serde::de::DeserializeOwned>(filename: &str) -> T {
         let path = format!("test_data/{filename}");
