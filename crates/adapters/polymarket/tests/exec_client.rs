@@ -1909,6 +1909,7 @@ async fn test_submit_market_order_http_5xx_submit_outcome_unknown() {
 async fn test_submit_market_order_ambiguous_then_definitive_refusal_stays_unknown() {
     let state = TestServerState::default();
     *state.order_post_500_remaining.lock().await = 1;
+    *state.single_order_response.lock().await = Some(Value::Null);
     *state.order_response_status.lock().await = StatusCode::SERVICE_UNAVAILABLE;
     *state.order_response.lock().await = Some(json!({"error": "trading is disabled"}));
     let addr = start_mock_server(state.clone()).await;
