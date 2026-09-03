@@ -22,6 +22,7 @@
 //! transient HTTP failures (timeouts, 5xx, rate limits).
 
 use std::{
+    collections::HashSet,
     error::Error as StdError,
     fmt::Display,
     sync::{
@@ -127,6 +128,7 @@ pub(crate) struct OrderSubmitter {
     order_builder: Arc<PolymarketOrderBuilder>,
     retry_manager: Arc<RetryManager<Error>>,
     durable_retry_manager: Arc<RetryManager<Error>>,
+    cancelled_submissions: Arc<Mutex<HashSet<String>>>,
 }
 
 impl OrderSubmitter {
@@ -147,6 +149,7 @@ impl OrderSubmitter {
             order_builder,
             retry_manager: Arc::new(RetryManager::new(retry_config)),
             durable_retry_manager: Arc::new(RetryManager::new(durable_retry_config)),
+            cancelled_submissions: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -331,6 +334,9 @@ impl OrderSubmitter {
 
     /// Cancels a single order with retry on transient failures.
     pub(crate) async fn cancel_order(&self, venue_order_id: &str) -> HttpResult<CancelResponse> {
+        if let Ok(mut cancelled) = self.cancelled_submissions.lock() {
+            cancelled.insert(venue_order_id.to_string());
+        }
         let http_client = self.http_client.clone();
         let order_id = venue_order_id.to_string();
         self.retry_manager
@@ -352,6 +358,9 @@ impl OrderSubmitter {
         &self,
         venue_order_ids: &[&str],
     ) -> HttpResult<CancelResponse> {
+        if let Ok(mut cancelled) = self.cancelled_submissions.lock() {
+            cancelled.extend(venue_order_ids.iter().map(|value| (*value).to_string()));
+        }
         let http_client = self.http_client.clone();
         let order_ids: Vec<String> = venue_order_ids.iter().map(|s| s.to_string()).collect();
 
@@ -506,6 +515,7 @@ impl OrderSubmitter {
         let reconcile_before_post = Arc::new(AtomicBool::new(false));
         let taint = Arc::clone(&ambiguous_reason);
         let reconcile = Arc::clone(&reconcile_before_post);
+        let cancelled_submissions = Arc::clone(&self.cancelled_submissions);
         let retry_manager = if durable {
             &self.durable_retry_manager
         } else {
@@ -519,7 +529,13 @@ impl OrderSubmitter {
                     let order = order.clone();
                     let taint = Arc::clone(&taint);
                     let reconcile = Arc::clone(&reconcile);
+                    let cancelled_submissions = Arc::clone(&cancelled_submissions);
                     async move {
+                        if cancelled_submissions.lock().is_ok_and(|cancelled| {
+                            cancelled.contains(expected_venue_order_id.as_str())
+                        }) {
+                            return Err(Error::exchange("durable submit cancelled"));
+                        }
                         // After any ambiguous POST (including malformed success
                         // bodies), query the exact signed hash before reposting.
                         if reconcile.load(Ordering::Acquire) {
