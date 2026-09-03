@@ -21,7 +21,11 @@
 //! Uses [`RetryManager`] from `nautilus-network` with exponential backoff for
 //! transient HTTP failures (timeouts, 5xx, rate limits).
 
-use std::{error::Error as StdError, fmt::Display, sync::Arc};
+use std::{
+    error::Error as StdError,
+    fmt::Display,
+    sync::{Arc, Mutex},
+};
 
 use nautilus_core::UnixNanos;
 use nautilus_model::{
@@ -246,20 +250,8 @@ impl OrderSubmitter {
             .order_builder
             .expected_order_id(&poly_order, neg_risk)?;
 
-        let http_client = self.http_client.clone();
-
         let response = match self
-            .retry_manager
-            .execute_with_retry(
-                "submit_market_order",
-                || {
-                    let http_client = http_client.clone();
-                    let poly_order = poly_order.clone();
-                    async move { http_client.post_order(&poly_order, order_type, false).await }
-                },
-                |e| e.is_retryable(),
-                Error::transport,
-            )
+            .post_order_with_retry("submit_market_order", poly_order, order_type, false)
             .await
         {
             Ok(response) => response,
@@ -289,18 +281,12 @@ impl OrderSubmitter {
         let expected_base_qty = prepared.expected_base_quantity;
         let order_type = prepared.order_type;
         let poly_order = prepared.order;
-        let http_client = self.http_client.clone();
         let response = match self
-            .retry_manager
-            .execute_with_retry(
+            .post_order_with_retry(
                 "submit_prepared_market_order",
-                || {
-                    let http_client = http_client.clone();
-                    let poly_order = poly_order.clone();
-                    async move { http_client.post_order(&poly_order, order_type, false).await }
-                },
-                |error| error.is_retryable(),
-                Error::transport,
+                poly_order,
+                order_type,
+                false,
             )
             .await
         {
@@ -469,28 +455,69 @@ impl OrderSubmitter {
         &self,
         submission: SignedLimitOrderSubmission,
     ) -> crate::http::error::Result<OrderResponse> {
-        let http_client = self.http_client.clone();
+        self.post_order_with_retry(
+            "submit_limit_order",
+            submission.order,
+            submission.order_type,
+            submission.post_only,
+        )
+        .await
+    }
 
-        self.retry_manager
+    /// Retries one already-signed payload while preserving ambiguity across the
+    /// entire operation. A later definitive refusal cannot prove an earlier
+    /// transport/generic-5xx/parse attempt was not accepted by the venue.
+    async fn post_order_with_retry(
+        &self,
+        operation: &'static str,
+        order: PolymarketOrder,
+        order_type: PolymarketOrderType,
+        post_only: bool,
+    ) -> crate::http::error::Result<OrderResponse> {
+        let http_client = self.http_client.clone();
+        let ambiguous_reason = Arc::new(Mutex::new(None::<String>));
+        let taint = Arc::clone(&ambiguous_reason);
+        let result = self
+            .retry_manager
             .execute_with_retry(
-                "submit_limit_order",
+                operation,
                 || {
                     let http_client = http_client.clone();
-                    let submission = submission.clone();
+                    let order = order.clone();
+                    let taint = Arc::clone(&taint);
                     async move {
-                        http_client
-                            .post_order(
-                                &submission.order,
-                                submission.order_type,
-                                submission.post_only,
-                            )
-                            .await
+                        let result = http_client.post_order(&order, order_type, post_only).await;
+                        if let Err(error) = &result
+                            && error.is_submit_outcome_unknown()
+                            && let Ok(mut reason) = taint.lock()
+                            && reason.is_none()
+                        {
+                            *reason = Some(error.to_string());
+                        }
+                        result
                     }
                 },
-                |e| e.is_retryable(),
+                |error| error.is_retryable(),
                 Error::transport,
             )
-            .await
+            .await;
+
+        match result {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                let earlier_ambiguity = ambiguous_reason
+                    .lock()
+                    .ok()
+                    .and_then(|reason| reason.clone());
+                if let Some(reason) = earlier_ambiguity {
+                    Err(Error::transport(format!(
+                        "submit outcome unknown after an earlier ambiguous attempt ({reason}); final attempt: {error}"
+                    )))
+                } else {
+                    Err(error)
+                }
+            }
+        }
     }
 
     pub(crate) async fn post_limit_order_submissions(

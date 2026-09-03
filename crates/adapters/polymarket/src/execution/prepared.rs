@@ -160,7 +160,10 @@ pub fn register_prepared_order(prepared: PreparedPolymarketOrder) -> anyhow::Res
 
 pub(crate) fn requires_prepared_order(client_order_id: &str) -> bool {
     client_order_id.starts_with("strategy:")
-        && (client_order_id.contains(":stop:") || client_order_id.contains(":tpsl:"))
+        && (client_order_id.contains(":stop:")
+            || client_order_id.contains(":tpsl:")
+            || client_order_id.contains(":iceberg:child:")
+            || client_order_id.contains(":ladder:rung:"))
 }
 
 pub fn discard_prepared_order(client_order_id: &str) -> bool {
@@ -302,9 +305,13 @@ mod tests {
     }
 
     #[test]
-    fn strategy_stop_and_tpsl_ids_require_preparation() {
+    fn strategy_child_ids_require_preparation() {
         assert!(requires_prepared_order("strategy:one:stop:entry"));
         assert!(requires_prepared_order("strategy:one:tpsl:tp"));
+        assert!(requires_prepared_order("strategy:one:ladder:rung:0"));
+        assert!(requires_prepared_order(
+            "strategy:one:iceberg:child:0:attempt:1"
+        ));
         assert!(!requires_prepared_order("strategy:one:ladder:0"));
         assert!(!requires_prepared_order("direct-order"));
     }
