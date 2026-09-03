@@ -2860,6 +2860,98 @@ async fn test_restored_prepared_order_gets_and_projects_terminal_before_any_post
 
 #[rstest]
 #[tokio::test]
+async fn test_restored_get_none_then_exact_refusal_remains_unknown_on_same_envelope() {
+    let state = TestServerState::default();
+    *state.single_order_response.lock().await = Some(Value::Null);
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    *state.order_response_status.lock().await = StatusCode::SERVICE_UNAVAILABLE;
+    *state.order_response.lock().await = Some(json!({"error": "trading is disabled"}));
+
+    let client_order_id = "strategy:recovered-unresolved:stop:entry";
+    let prepared = recovered_prepared_limit_order(client_order_id);
+    register_recovered_prepared_order(prepared).unwrap();
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client_with_retries(addr, 1);
+    client.start().unwrap();
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache(&cache, instrument_id);
+    let order = make_limit_order(
+        client_order_id,
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+
+    client
+        .submit_order(make_submit_cmd(&order, instrument_id))
+        .unwrap();
+    assert_order_event(rx.try_recv().unwrap(), "Submitted");
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { *state.order_post_count.lock().await >= 2 }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_no_execution_event(&mut rx).await;
+    let bodies = state.order_bodies.lock().await;
+    assert!(bodies.len() >= 2);
+    assert!(bodies.windows(2).all(|pair| pair[0] == pair[1]));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_restored_get_none_projects_fill_from_exact_trade_without_repost() {
+    let state = TestServerState::default();
+    *state.single_order_response.lock().await = Some(Value::Null);
+    let client_order_id = "strategy:recovered-trade:stop:entry";
+    let prepared = recovered_prepared_limit_order(client_order_id);
+    let expected_order_id = prepared.expected_venue_order_id.clone();
+    *state.trades_response_override.lock().await =
+        Some(recovery_trades_response(&expected_order_id, "10", "0.5"));
+    register_recovered_prepared_order(prepared).unwrap();
+
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache(&cache, instrument_id);
+    let order = make_limit_order(
+        client_order_id,
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+
+    client
+        .submit_order(make_submit_cmd(&order, instrument_id))
+        .unwrap();
+    assert_order_event(recv_execution_event(&mut rx).await, "Submitted");
+    assert_order_event(recv_execution_event(&mut rx).await, "Accepted");
+    assert_order_status_report(recv_execution_event(&mut rx).await, OrderStatus::Filled);
+    assert_eq!(*state.order_post_count.lock().await, 0);
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_submit_order_retries_5xx_and_accepts_when_recovered() {
     // Server returns 500 twice, then 200 on the third attempt. With
     // max_retries=2 the submitter should consume both retries and accept

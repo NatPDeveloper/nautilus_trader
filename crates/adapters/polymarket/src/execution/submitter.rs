@@ -50,12 +50,14 @@ use super::{
     types::{LimitOrderSubmitRequest, SignedLimitOrderSubmission},
 };
 use crate::{
-    common::enums::{PolymarketOrderSide, PolymarketOrderType},
+    common::enums::{
+        PolymarketOrderSide, PolymarketOrderStatus, PolymarketOrderType, PolymarketTradeStatus,
+    },
     http::{
         clob::PolymarketClobHttpClient,
         error::{Error, Result as HttpResult},
-        models::{PolymarketOpenOrder, PolymarketOrder},
-        query::{CancelResponse, OrderResponse},
+        models::{PolymarketOpenOrder, PolymarketOrder, PolymarketTradeReport},
+        query::{CancelResponse, GetTradesParams, OrderResponse},
     },
 };
 
@@ -518,7 +520,13 @@ impl OrderSubmitter {
         recovered: bool,
     ) -> crate::http::error::Result<OrderResponse> {
         let http_client = self.http_client.clone();
-        let ambiguous_reason = Arc::new(Mutex::new(None::<String>));
+        // A restored envelope is ambiguous by definition: the previous
+        // process may have crashed after the venue accepted and filled it.
+        // GET-none does not clear that taint because terminal orders disappear
+        // from the active-order endpoint.
+        let ambiguous_reason = Arc::new(Mutex::new((durable && recovered).then(|| {
+            "recovered durable envelope has an unresolved pre-crash submit outcome".to_string()
+        })));
         let reconcile_before_post = Arc::new(AtomicBool::new(durable && recovered));
         let taint = Arc::clone(&ambiguous_reason);
         let reconcile = Arc::clone(&reconcile_before_post);
@@ -564,7 +572,27 @@ impl OrderSubmitter {
                                         found.id
                                     )));
                                 }
-                                Ok(None) => {}
+                                Ok(None) => {
+                                    // Active-order absence is not authoritative:
+                                    // a filled IOC/GTC order also disappears.
+                                    // Search authenticated trade history for the
+                                    // exact deterministic hash before reposting.
+                                    let trades =
+                                        http_client.get_trades(GetTradesParams::default()).await?;
+                                    if let Some(found) = reconciled_order_from_trades(
+                                        &trades,
+                                        &order,
+                                        order_type,
+                                        expected_venue_order_id.as_str(),
+                                    ) {
+                                        return Ok(OrderResponse {
+                                            success: true,
+                                            order_id: Some(expected_venue_order_id.to_string()),
+                                            error_msg: None,
+                                            reconciled_order: Some(found),
+                                        });
+                                    }
+                                }
                                 Err(error) => return Err(error),
                             }
                         }
@@ -647,6 +675,76 @@ impl OrderSubmitter {
         // the whole batch without an idempotency key we can verify here.
         self.http_client.post_orders(&order_refs).await
     }
+}
+
+fn reconciled_order_from_trades(
+    trades: &[PolymarketTradeReport],
+    order: &PolymarketOrder,
+    order_type: PolymarketOrderType,
+    expected_order_id: &str,
+) -> Option<PolymarketOpenOrder> {
+    let mut filled = Decimal::ZERO;
+    let mut weighted_price = Decimal::ZERO;
+    let mut matched_trade = None;
+    let mut matched_outcome = None;
+    let mut matched_asset_id = None;
+
+    for trade in trades
+        .iter()
+        .filter(|trade| trade.status != PolymarketTradeStatus::Failed)
+    {
+        if trade.taker_order_id == expected_order_id {
+            filled += trade.size;
+            weighted_price += trade.size * trade.price;
+            matched_outcome.get_or_insert_with(|| trade.outcome.clone());
+            matched_asset_id.get_or_insert(trade.asset_id);
+            matched_trade.get_or_insert(trade);
+            continue;
+        }
+        if let Some(maker) = trade
+            .maker_orders
+            .iter()
+            .find(|maker| maker.order_id == expected_order_id)
+        {
+            filled += maker.matched_amount;
+            weighted_price += maker.matched_amount * maker.price;
+            matched_outcome.get_or_insert_with(|| maker.outcome.clone());
+            matched_asset_id.get_or_insert(maker.asset_id);
+            matched_trade.get_or_insert(trade);
+        }
+    }
+
+    let trade = matched_trade?;
+    if filled <= Decimal::ZERO {
+        return None;
+    }
+    let scale = Decimal::from(1_000_000_u64);
+    let original_size = match order.side {
+        PolymarketOrderSide::Buy => order.taker_amount / scale,
+        PolymarketOrderSide::Sell => order.maker_amount / scale,
+    };
+    let price = weighted_price / filled;
+    Some(PolymarketOpenOrder {
+        associate_trades: Some(vec![trade.id.clone()]),
+        id: expected_order_id.to_string(),
+        status: if filled >= original_size {
+            PolymarketOrderStatus::Matched
+        } else {
+            PolymarketOrderStatus::Canceled
+        },
+        market: trade.market,
+        original_size,
+        outcome: matched_outcome.unwrap_or_else(|| trade.outcome.clone()),
+        maker_address: order.maker.clone(),
+        owner: trade.owner.clone(),
+        price,
+        side: order.side,
+        size_matched: filled,
+        asset_id: matched_asset_id.unwrap_or(order.token_id),
+        expiration: (order.expiration != "0").then(|| order.expiration.clone()),
+        order_type,
+        created_at: order.timestamp.parse().unwrap_or_default(),
+    })
 }
 
 // Converts a nanos expire time to the unix-seconds string expected by the
