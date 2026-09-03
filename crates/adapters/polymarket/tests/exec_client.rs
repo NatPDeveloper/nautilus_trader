@@ -92,6 +92,7 @@ const CANCEL_ALREADY_DONE_ORDER_ID: &str =
 #[derive(Clone)]
 struct TestServerState {
     last_body: Arc<tokio::sync::Mutex<Option<Value>>>,
+    order_bodies: Arc<tokio::sync::Mutex<Vec<Value>>>,
     last_headers: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
     last_path: Arc<tokio::sync::Mutex<String>>,
     gamma_response: Arc<tokio::sync::Mutex<Option<Value>>>,
@@ -123,6 +124,7 @@ impl Default for TestServerState {
     fn default() -> Self {
         Self {
             last_body: Arc::new(tokio::sync::Mutex::new(None)),
+            order_bodies: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             last_headers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             last_path: Arc::new(tokio::sync::Mutex::new(String::new())),
             gamma_response: Arc::new(tokio::sync::Mutex::new(None)),
@@ -332,6 +334,7 @@ async fn handle_post_order(
     *state.order_post_count.lock().await += 1;
 
     if let Ok(v) = serde_json::from_slice::<Value>(&body) {
+        state.order_bodies.lock().await.push(v.clone());
         *state.last_body.lock().await = Some(v);
     }
 
@@ -2681,8 +2684,54 @@ async fn test_submit_order_retries_5xx_and_accepts_when_recovered() {
         .unwrap();
     assert_order_event(event, "Accepted");
 
-    // Three POSTs total: two failed retries plus the recovered call.
+    // Three POSTs total: two failed retries plus the recovered call. Every
+    // retry reuses the exact signed body, so it cannot create a new order hash.
     assert_eq!(*state.order_post_count.lock().await, 3);
+    let bodies = state.order_bodies.lock().await;
+    assert_eq!(bodies.len(), 3);
+    assert!(bodies.windows(2).all(|pair| pair[0] == pair[1]));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_exact_trading_disabled_refusal_retries_same_hash_then_rejects() {
+    let state = TestServerState::default();
+    *state.order_response_status.lock().await = StatusCode::SERVICE_UNAVAILABLE;
+    *state.order_response.lock().await = Some(json!({"error": "trading is disabled"}));
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client_with_retries(addr, 2);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache(&cache, instrument_id);
+    let order = make_limit_order(
+        "O-TRADING-DISABLED",
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+
+    client
+        .submit_order(make_submit_cmd(&order, instrument_id))
+        .unwrap();
+    assert_order_event(rx.try_recv().unwrap(), "Submitted");
+    let rejected = assert_order_event(recv_execution_event(&mut rx).await, "Rejected");
+    assert_eq!(
+        order_event_reason(&rejected),
+        "definitive retryable refusal: trading is disabled"
+    );
+
+    assert_eq!(*state.order_post_count.lock().await, 3);
+    let bodies = state.order_bodies.lock().await;
+    assert_eq!(bodies.len(), 3);
+    assert!(bodies.windows(2).all(|pair| pair[0] == pair[1]));
 }
 
 #[rstest]
@@ -2731,6 +2780,84 @@ async fn test_submit_order_5xx_exhausts_retries_submit_outcome_unknown() {
 
     // Initial attempt + 2 retries = 3 POSTs, then give up.
     assert_eq!(*state.order_post_count.lock().await, 3);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_late_cancel_uses_expected_hash_after_ambiguous_submit() {
+    let state = TestServerState::default();
+    *state.order_response_status.lock().await = StatusCode::INTERNAL_SERVER_ERROR;
+    *state.order_response.lock().await = Some(json!({"error": "transient server error"}));
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client_with_retries(addr, 0);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache(&cache, instrument_id);
+    let mut order = make_limit_order(
+        "O-AMBIGUOUS-LATE-CANCEL",
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    // Mirror the engine's state by the time the execution client receives a
+    // user cancellation: the order is already pending cancel in cache.
+    submit_and_pending_cancel(&cache, &mut order);
+
+    client
+        .submit_order(make_submit_cmd(&order, instrument_id))
+        .unwrap();
+    assert_order_event(rx.try_recv().unwrap(), "Submitted");
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { *state.order_post_count.lock().await == 1 }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_no_execution_event(&mut rx).await;
+
+    client
+        .query_order(QueryOrder::new(
+            TraderId::from("TESTER-001"),
+            Some(*POLYMARKET_CLIENT_ID),
+            StrategyId::from("S-001"),
+            instrument_id,
+            ClientOrderId::from("O-AMBIGUOUS-LATE-CANCEL"),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+    assert_order_status_report(recv_execution_event(&mut rx).await, OrderStatus::Accepted);
+
+    client
+        .cancel_order(make_cancel_cmd("O-AMBIGUOUS-LATE-CANCEL", instrument_id))
+        .unwrap();
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { *state.cancel_delete_count.lock().await == 1 }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let body = state.last_body.lock().await.clone().unwrap();
+    let expected_id = body.get("orderID").and_then(Value::as_str).unwrap();
+    assert!(expected_id.starts_with("0x"));
+    assert_eq!(expected_id.len(), 66);
+    assert_ne!(expected_id, DEFAULT_ACCEPTED_ORDER_ID);
 }
 
 #[rstest]

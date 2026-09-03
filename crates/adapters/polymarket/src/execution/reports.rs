@@ -204,10 +204,15 @@ impl PolymarketExecutionClient {
     pub(super) fn query_order_command(&self, cmd: &QueryOrder) {
         log::debug!("Querying order: client_order_id={}", cmd.client_order_id);
 
-        let venue_order_id = match &cmd.venue_order_id {
+        let venue_order_id = match cmd
+            .venue_order_id
+            .or_else(|| self.pending_submits.venue_order_id(&cmd.client_order_id))
+        {
             Some(id) => id.to_string(),
             None => {
-                log::warn!("query_order requires venue_order_id for Polymarket");
+                log::warn!(
+                    "query_order requires an exact or pending expected venue_order_id for Polymarket"
+                );
                 return;
             }
         };

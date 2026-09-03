@@ -26,7 +26,7 @@ pub mod order_builder;
 pub(crate) mod order_fill_tracker;
 pub mod parse;
 pub mod prepared;
-pub(crate) mod pending;
+pub mod pending;
 pub(crate) mod reconciliation;
 pub(crate) mod submitter;
 pub(crate) mod types;

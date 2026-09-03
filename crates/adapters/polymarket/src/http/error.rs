@@ -16,7 +16,19 @@
 //! HTTP error types for the Polymarket adapter.
 
 use nautilus_network::http::{HttpClientError, ReqwestError, StatusCode};
+use serde::Deserialize;
 use thiserror::Error;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TradingDisabledRefusal {
+    error: String,
+}
+
+fn is_exact_trading_disabled_refusal(body: &[u8]) -> bool {
+    serde_json::from_slice::<TradingDisabledRefusal>(body)
+        .is_ok_and(|payload| payload.error == "trading is disabled")
+}
 
 /// Error type for Polymarket HTTP operations.
 #[derive(Debug, Error)]
@@ -42,6 +54,11 @@ pub enum Error {
 
     #[error("exchange error: {0}")]
     Exchange(String),
+
+    /// The venue explicitly proved that the submit was not accepted, but the
+    /// refusal can become valid later (for example, a temporarily halted book).
+    #[error("definitive retryable refusal: {0}")]
+    DefinitiveRetryableRefusal(String),
 
     #[error("timeout")]
     Timeout,
@@ -97,18 +114,15 @@ impl Error {
 
     /// Classifies an HTTP status code and body into the appropriate error variant.
     pub fn from_http_status(status: StatusCode, body: &[u8]) -> Self {
-        let message = String::from_utf8_lossy(body).to_string();
-        match status.as_u16() {
-            401 | 403 => Self::auth(format!("HTTP {}: {message}", status.as_u16())),
-            400 => Self::bad_request(format!("HTTP {}: {message}", status.as_u16())),
-            429 => Self::rate_limit("unknown", 0, None),
-            _ => Self::http(status.as_u16(), message),
-        }
+        Self::from_status_code(status.as_u16(), body)
     }
 
     /// Classifies a raw status code (as `u16`) and body into the appropriate error variant.
     pub fn from_status_code(status: u16, body: &[u8]) -> Self {
         let message = String::from_utf8_lossy(body).to_string();
+        if status == 503 && is_exact_trading_disabled_refusal(body) {
+            return Self::DefinitiveRetryableRefusal("trading is disabled".to_string());
+        }
         match status {
             401 | 403 => Self::auth(format!("HTTP {status}: {message}")),
             400 => Self::bad_request(format!("HTTP {status}: {message}")),
@@ -144,7 +158,10 @@ impl Error {
 
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Transport(_) | Self::Timeout | Self::RateLimit { .. } => true,
+            Self::Transport(_)
+            | Self::Timeout
+            | Self::RateLimit { .. }
+            | Self::DefinitiveRetryableRefusal(_) => true,
             Self::Http { status, .. } => *status >= 500,
             _ => false,
         }
@@ -161,7 +178,11 @@ impl Error {
             | Self::Decode(_)
             | Self::Io(_) => true,
             Self::Http { status, .. } => *status >= 500,
-            Self::Auth(_) | Self::BadRequest(_) | Self::Exchange(_) | Self::UrlParse(_) => false,
+            Self::Auth(_)
+            | Self::BadRequest(_)
+            | Self::Exchange(_)
+            | Self::DefinitiveRetryableRefusal(_)
+            | Self::UrlParse(_) => false,
         }
     }
 
@@ -230,6 +251,9 @@ mod tests {
         assert!(Error::Timeout.is_retryable());
         assert!(Error::rate_limit("test", 10, None).is_retryable());
         assert!(Error::http(500, "server error").is_retryable());
+        assert!(
+            Error::DefinitiveRetryableRefusal("trading is disabled".to_string()).is_retryable()
+        );
 
         assert!(!Error::auth("test").is_retryable());
         assert!(!Error::bad_request("test").is_retryable());
@@ -247,5 +271,31 @@ mod tests {
         assert!(!Error::auth("test").is_submit_outcome_unknown());
         assert!(!Error::bad_request("test").is_submit_outcome_unknown());
         assert!(!Error::http(404, "not found").is_submit_outcome_unknown());
+        assert!(
+            !Error::DefinitiveRetryableRefusal("trading is disabled".to_string())
+                .is_submit_outcome_unknown()
+        );
+    }
+
+    #[test]
+    fn exact_trading_disabled_503_is_a_definitive_retryable_refusal() {
+        let error = Error::from_status_code(503, br#" { "error" : "trading is disabled" } "#);
+        assert!(matches!(error, Error::DefinitiveRetryableRefusal(_)));
+        assert!(error.is_retryable());
+        assert!(!error.is_submit_outcome_unknown());
+    }
+
+    #[test]
+    fn other_503_shapes_remain_ambiguous() {
+        for body in [
+            br#"{"error":"service unavailable"}"#.as_slice(),
+            br#"{"error":"trading is disabled","retry":true}"#.as_slice(),
+            br#"{"error":"Trading is disabled"}"#.as_slice(),
+            br#"not-json"#.as_slice(),
+        ] {
+            let error = Error::from_status_code(503, body);
+            assert!(matches!(error, Error::Http { status: 503, .. }));
+            assert!(error.is_submit_outcome_unknown());
+        }
     }
 }

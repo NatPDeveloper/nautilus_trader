@@ -73,11 +73,12 @@ impl PolymarketExecutionClient {
                 .cache()
                 .venue_order_id(&cmd.client_order_id)
                 .copied()
+                .or_else(|| self.pending_submits.venue_order_id(&cmd.client_order_id))
             {
                 Some(id) => id,
                 None => {
                     log::debug!(
-                        "Cancel for {} deferred, venue_order_id not yet available",
+                        "Cancel for {} deferred, expected venue_order_id not yet available",
                         cmd.client_order_id
                     );
                     self.pending_cancels.insert(cmd.client_order_id);
