@@ -575,7 +575,12 @@ impl OrderSubmitter {
                         result
                     }
                 },
-                |error| error.is_retryable(),
+                |error| {
+                    error.is_retryable()
+                        && (!durable
+                            || error.is_submit_outcome_unknown()
+                            || ambiguous_reason.lock().is_ok_and(|reason| reason.is_some()))
+                },
                 Error::transport,
             )
             .await;
