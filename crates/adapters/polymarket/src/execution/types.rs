@@ -66,6 +66,9 @@ pub(crate) struct SignedLimitOrderSubmission {
     pub(crate) order_type: PolymarketOrderType,
     pub(crate) post_only: bool,
     pub(crate) expected_venue_order_id: VenueOrderId,
+    /// True when the exact envelope is durably persisted by the caller and
+    /// may therefore be reconciled/reposted without a new signature.
+    pub(crate) prepared: bool,
 }
 
 #[derive(Clone, Debug)]

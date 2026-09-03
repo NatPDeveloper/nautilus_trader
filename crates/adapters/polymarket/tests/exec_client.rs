@@ -102,6 +102,8 @@ struct TestServerState {
     /// When > 0, `handle_post_order` returns 500 on this many calls before
     /// reverting to the configured `order_response_status`. Used by retry tests.
     order_post_500_remaining: Arc<tokio::sync::Mutex<usize>>,
+    /// When > 0, return an HTTP 200 body that cannot be decoded as JSON.
+    order_post_malformed_remaining: Arc<tokio::sync::Mutex<usize>>,
     batch_order_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     batch_order_response_status: Arc<tokio::sync::Mutex<StatusCode>>,
     batch_order_post_count: Arc<tokio::sync::Mutex<usize>>,
@@ -132,6 +134,7 @@ impl Default for TestServerState {
             order_response_status: Arc::new(tokio::sync::Mutex::new(StatusCode::OK)),
             order_post_count: Arc::new(tokio::sync::Mutex::new(0)),
             order_post_500_remaining: Arc::new(tokio::sync::Mutex::new(0)),
+            order_post_malformed_remaining: Arc::new(tokio::sync::Mutex::new(0)),
             batch_order_response: Arc::new(tokio::sync::Mutex::new(None)),
             batch_order_response_status: Arc::new(tokio::sync::Mutex::new(StatusCode::OK)),
             batch_order_post_count: Arc::new(tokio::sync::Mutex::new(0)),
@@ -348,6 +351,13 @@ async fn handle_post_order(
             .into_response();
     }
     drop(remaining_500);
+
+    let mut malformed_remaining = state.order_post_malformed_remaining.lock().await;
+    if *malformed_remaining > 0 {
+        *malformed_remaining -= 1;
+        return (StatusCode::OK, "{malformed").into_response();
+    }
+    drop(malformed_remaining);
 
     let status = *state.order_response_status.lock().await;
     let resp = state.order_response.lock().await;
@@ -2636,6 +2646,50 @@ async fn test_submit_order_rejected_on_http_failure_response() {
 
 #[rstest]
 #[tokio::test]
+async fn test_submit_order_success_without_order_id_is_ambiguous() {
+    let state = TestServerState::default();
+    *state.order_response.lock().await = Some(json!({"success": true, "errorMsg": ""}));
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache(&cache, instrument_id);
+    let order = make_limit_order(
+        "O-SUCCESS-NO-ID",
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+
+    client
+        .submit_order(make_submit_cmd(&order, instrument_id))
+        .unwrap();
+    assert_order_event(rx.try_recv().unwrap(), "Submitted");
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { *state.order_post_count.lock().await == 1 }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_no_execution_event(&mut rx).await;
+    assert!(
+        nautilus_polymarket::execution::pending::expected_venue_order_id("O-SUCCESS-NO-ID")
+            .is_some()
+    );
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_submit_order_http_5xx_submit_outcome_unknown() {
     let state = TestServerState::default();
     *state.order_response_status.lock().await = StatusCode::INTERNAL_SERVER_ERROR;
@@ -2684,9 +2738,10 @@ async fn test_submit_order_http_5xx_submit_outcome_unknown() {
 async fn test_submit_order_retries_5xx_and_accepts_when_recovered() {
     // Server returns 500 twice, then 200 on the third attempt. With
     // max_retries=2 the submitter should consume both retries and accept
-    // on the third call.
+    // on the third call. Exact-hash reconciliation explicitly reports absent.
     let state = TestServerState::default();
     *state.order_post_500_remaining.lock().await = 2;
+    *state.single_order_response.lock().await = Some(Value::Null);
     let addr = start_mock_server(state.clone()).await;
     let (mut client, mut rx, cache) = create_test_execution_client_with_retries(addr, 2);
     client.start().unwrap();
@@ -2777,6 +2832,7 @@ async fn test_exact_trading_disabled_refusal_retries_same_hash_then_rejects() {
 async fn test_submit_order_ambiguous_then_definitive_refusal_stays_unknown() {
     let state = TestServerState::default();
     *state.order_post_500_remaining.lock().await = 1;
+    *state.single_order_response.lock().await = Some(Value::Null);
     *state.order_response_status.lock().await = StatusCode::SERVICE_UNAVAILABLE;
     *state.order_response.lock().await = Some(json!({"error": "trading is disabled"}));
     let addr = start_mock_server(state.clone()).await;
@@ -2819,11 +2875,58 @@ async fn test_submit_order_ambiguous_then_definitive_refusal_stays_unknown() {
 
 #[rstest]
 #[tokio::test]
+async fn test_submit_order_malformed_then_definitive_refusal_stays_unknown() {
+    let state = TestServerState::default();
+    *state.order_post_malformed_remaining.lock().await = 1;
+    *state.single_order_response.lock().await = Some(Value::Null);
+    *state.order_response_status.lock().await = StatusCode::SERVICE_UNAVAILABLE;
+    *state.order_response.lock().await = Some(json!({"error": "trading is disabled"}));
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client_with_retries(addr, 1);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache(&cache, instrument_id);
+    let order = make_limit_order(
+        "O-MALFORMED-MIXED-UNKNOWN",
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+
+    client
+        .submit_order(make_submit_cmd(&order, instrument_id))
+        .unwrap();
+    assert_order_event(rx.try_recv().unwrap(), "Submitted");
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { *state.order_post_count.lock().await == 2 }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_no_execution_event(&mut rx).await;
+    let bodies = state.order_bodies.lock().await;
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[0], bodies[1]);
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_submit_order_5xx_exhausts_retries_submit_outcome_unknown() {
     // Server returns 500 three times. With max_retries=2 the submitter
     // exhausts retries on the third attempt and leaves the submit outcome unknown.
     let state = TestServerState::default();
     *state.order_post_500_remaining.lock().await = 3;
+    *state.single_order_response.lock().await = Some(Value::Null);
     let addr = start_mock_server(state.clone()).await;
     let (mut client, mut rx, cache) = create_test_execution_client_with_retries(addr, 2);
     client.start().unwrap();

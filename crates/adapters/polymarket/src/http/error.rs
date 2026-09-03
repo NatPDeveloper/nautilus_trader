@@ -161,6 +161,9 @@ impl Error {
             Self::Transport(_)
             | Self::Timeout
             | Self::RateLimit { .. }
+            | Self::Serde(_)
+            | Self::Decode(_)
+            | Self::Io(_)
             | Self::DefinitiveRetryableRefusal(_) => true,
             Self::Http { status, .. } => *status >= 500,
             _ => false,
@@ -257,7 +260,12 @@ mod tests {
 
         assert!(!Error::auth("test").is_retryable());
         assert!(!Error::bad_request("test").is_retryable());
-        assert!(!Error::decode("test").is_retryable());
+        assert!(Error::decode("test").is_retryable());
+        assert!(
+            Error::Serde(serde_json::from_str::<serde_json::Value>("{").unwrap_err())
+                .is_retryable()
+        );
+        assert!(Error::Io(std::io::Error::other("test")).is_retryable());
     }
 
     #[rstest]

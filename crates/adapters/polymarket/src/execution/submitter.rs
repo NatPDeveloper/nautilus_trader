@@ -24,7 +24,10 @@
 use std::{
     error::Error as StdError,
     fmt::Display,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use nautilus_core::UnixNanos;
@@ -123,6 +126,7 @@ pub(crate) struct OrderSubmitter {
     http_client: PolymarketClobHttpClient,
     order_builder: Arc<PolymarketOrderBuilder>,
     retry_manager: Arc<RetryManager<Error>>,
+    durable_retry_manager: Arc<RetryManager<Error>>,
 }
 
 impl OrderSubmitter {
@@ -131,10 +135,18 @@ impl OrderSubmitter {
         order_builder: Arc<PolymarketOrderBuilder>,
         retry_config: RetryConfig,
     ) -> Self {
+        let mut durable_retry_config = retry_config.clone();
+        // Prepared strategy envelopes are durable and have an exact venue hash.
+        // Keep reconciling/reposting that one authorization until acceptance or
+        // operator cancellation; never fall back to signing a replacement.
+        durable_retry_config.max_retries = u32::MAX;
+        durable_retry_config.max_elapsed_ms = None;
+        durable_retry_config.jitter_ms = 0;
         Self {
             http_client,
             order_builder,
             retry_manager: Arc::new(RetryManager::new(retry_config)),
+            durable_retry_manager: Arc::new(RetryManager::new(durable_retry_config)),
         }
     }
 
@@ -251,7 +263,14 @@ impl OrderSubmitter {
             .expected_order_id(&poly_order, neg_risk)?;
 
         let response = match self
-            .post_order_with_retry("submit_market_order", poly_order, order_type, false)
+            .post_order_with_retry(
+                "submit_market_order",
+                poly_order,
+                order_type,
+                false,
+                expected_venue_order_id,
+                false,
+            )
             .await
         {
             Ok(response) => response,
@@ -287,6 +306,8 @@ impl OrderSubmitter {
                 poly_order,
                 order_type,
                 false,
+                expected_venue_order_id,
+                true,
             )
             .await
         {
@@ -416,6 +437,7 @@ impl OrderSubmitter {
                 expected_venue_order_id: VenueOrderId::from(
                     prepared.expected_venue_order_id.as_str(),
                 ),
+                prepared: true,
             });
         }
         if requires_prepared_order(&prepared_request.client_order_id) {
@@ -448,6 +470,7 @@ impl OrderSubmitter {
             order_type,
             post_only: request.post_only,
             expected_venue_order_id,
+            prepared: false,
         })
     }
 
@@ -460,6 +483,8 @@ impl OrderSubmitter {
             submission.order,
             submission.order_type,
             submission.post_only,
+            submission.expected_venue_order_id,
+            submission.prepared,
         )
         .await
     }
@@ -473,26 +498,79 @@ impl OrderSubmitter {
         order: PolymarketOrder,
         order_type: PolymarketOrderType,
         post_only: bool,
+        expected_venue_order_id: VenueOrderId,
+        durable: bool,
     ) -> crate::http::error::Result<OrderResponse> {
         let http_client = self.http_client.clone();
         let ambiguous_reason = Arc::new(Mutex::new(None::<String>));
+        let reconcile_before_post = Arc::new(AtomicBool::new(false));
         let taint = Arc::clone(&ambiguous_reason);
-        let result = self
-            .retry_manager
+        let reconcile = Arc::clone(&reconcile_before_post);
+        let retry_manager = if durable {
+            &self.durable_retry_manager
+        } else {
+            &self.retry_manager
+        };
+        let result = retry_manager
             .execute_with_retry(
                 operation,
                 || {
                     let http_client = http_client.clone();
                     let order = order.clone();
                     let taint = Arc::clone(&taint);
+                    let reconcile = Arc::clone(&reconcile);
                     async move {
-                        let result = http_client.post_order(&order, order_type, post_only).await;
+                        // After any ambiguous POST (including malformed success
+                        // bodies), query the exact signed hash before reposting.
+                        if reconcile.load(Ordering::Acquire) {
+                            match http_client
+                                .get_order_optional(expected_venue_order_id.as_str())
+                                .await
+                            {
+                                Ok(Some(found)) if found.id == expected_venue_order_id.as_str() => {
+                                    return Ok(OrderResponse {
+                                        success: true,
+                                        order_id: Some(expected_venue_order_id.to_string()),
+                                        error_msg: None,
+                                    });
+                                }
+                                Ok(Some(found)) => {
+                                    return Err(Error::decode(format!(
+                                        "exact-order query returned mismatched id {}",
+                                        found.id
+                                    )));
+                                }
+                                Ok(None) => {}
+                                Err(error) => return Err(error),
+                            }
+                        }
+
+                        let mut result =
+                            http_client.post_order(&order, order_type, post_only).await;
+                        if let Ok(response) = &result {
+                            let missing_id = response.success
+                                && response.order_id.as_deref().is_none_or(str::is_empty);
+                            let duplicate = response.error_msg.as_deref().is_some_and(|reason| {
+                                let reason = reason.to_ascii_lowercase();
+                                reason.contains("already exists") || reason.contains("duplicate")
+                            });
+                            if missing_id || duplicate {
+                                result = Err(Error::decode(if missing_id {
+                                    "successful submit response omitted orderID"
+                                } else {
+                                    "venue reported an already-existing order"
+                                }));
+                            }
+                        }
                         if let Err(error) = &result
                             && error.is_submit_outcome_unknown()
-                            && let Ok(mut reason) = taint.lock()
-                            && reason.is_none()
                         {
-                            *reason = Some(error.to_string());
+                            reconcile.store(true, Ordering::Release);
+                            if let Ok(mut reason) = taint.lock()
+                                && reason.is_none()
+                            {
+                                *reason = Some(error.to_string());
+                            }
                         }
                         result
                     }
