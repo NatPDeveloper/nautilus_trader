@@ -35,7 +35,7 @@ use super::{
     responses::{
         check_immediate_order_status, emit_market_order_submitted, handle_batch_order_responses,
         handle_order_response, handle_single_order_response, handle_unknown_submit_result,
-        reject_submit_order,
+        project_reconciled_order_status, reject_submit_order,
     },
     submitter::{MarketBuyFeeContext, MarketOrderSubmitRequest, UnknownSubmitError},
     types::{BatchLimitOrderContext, LimitOrderSubmitRequest},
@@ -107,11 +107,14 @@ impl PolymarketExecutionClient {
             let expected_venue_order_id = submission.expected_venue_order_id;
             match submitter.post_limit_order_submission(submission).await {
                 Ok(response) => {
+                    let reconciled_order = response.reconciled_order.clone();
                     let confirmation_order_id = response
                         .order_id
                         .as_ref()
                         .filter(|_| {
-                            response.success && matches!(tif, TimeInForce::Ioc | TimeInForce::Fok)
+                            reconciled_order.is_none()
+                                && response.success
+                                && matches!(tif, TimeInForce::Ioc | TimeInForce::Fok)
                         })
                         .cloned();
                     if let Some((order_id_str, venue_order_id)) = handle_order_response(
@@ -137,7 +140,17 @@ impl PolymarketExecutionClient {
                         )
                         .await;
                     }
-                    if let Some(order_id) = confirmation_order_id {
+                    if let Some(venue_order) = reconciled_order.as_ref() {
+                        project_reconciled_order_status(
+                            venue_order,
+                            &order,
+                            &emitter,
+                            account_id,
+                            size_precision,
+                            price_precision,
+                            clock,
+                        );
+                    } else if let Some(order_id) = confirmation_order_id {
                         check_immediate_order_status(
                             &submitter,
                             &order_id,
@@ -278,6 +291,7 @@ impl PolymarketExecutionClient {
             {
                 Ok(result) => {
                     let mut order = order;
+                    let reconciled_order = result.response.reconciled_order.clone();
                     emit_market_order_submitted(
                         &mut order,
                         is_quote_qty,
@@ -307,7 +321,8 @@ impl PolymarketExecutionClient {
                         .order_id
                         .as_ref()
                         .filter(|_| {
-                            result.response.success
+                            reconciled_order.is_none()
+                                && result.response.success
                                 && matches!(time_in_force, TimeInForce::Ioc | TimeInForce::Fok)
                         })
                         .cloned();
@@ -336,7 +351,17 @@ impl PolymarketExecutionClient {
                         .await;
                     }
 
-                    if let Some(order_id) = confirmation_order_id {
+                    if let Some(venue_order) = reconciled_order.as_ref() {
+                        project_reconciled_order_status(
+                            venue_order,
+                            &order,
+                            &emitter,
+                            account_id,
+                            size_precision,
+                            price_precision,
+                            clock,
+                        );
+                    } else if let Some(order_id) = confirmation_order_id {
                         check_immediate_order_status(
                             &submitter,
                             &order_id,

@@ -72,10 +72,19 @@ use nautilus_network::http::HttpClient;
 use nautilus_polymarket::{
     common::{
         consts::{POLYMARKET_CLIENT_ID, POLYMARKET_VENUE},
+        credential::EvmPrivateKey,
         enums::SignatureType,
     },
     config::PolymarketExecClientConfig,
-    execution::PolymarketExecutionClient,
+    execution::{
+        PolymarketExecutionClient,
+        order_builder::PolymarketOrderBuilder,
+        prepared::{
+            PreparedOrderKind, PreparedOrderRequest, PreparedPolymarketOrder,
+            register_recovered_prepared_order,
+        },
+    },
+    signing::eip712::OrderSigner,
 };
 use rstest::rstest;
 use rust_decimal_macros::dec;
@@ -99,6 +108,7 @@ struct TestServerState {
     order_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     order_response_status: Arc<tokio::sync::Mutex<StatusCode>>,
     order_post_count: Arc<tokio::sync::Mutex<usize>>,
+    request_sequence: Arc<tokio::sync::Mutex<Vec<&'static str>>>,
     /// When > 0, `handle_post_order` returns 500 on this many calls before
     /// reverting to the configured `order_response_status`. Used by retry tests.
     order_post_500_remaining: Arc<tokio::sync::Mutex<usize>>,
@@ -133,6 +143,7 @@ impl Default for TestServerState {
             order_response: Arc::new(tokio::sync::Mutex::new(None)),
             order_response_status: Arc::new(tokio::sync::Mutex::new(StatusCode::OK)),
             order_post_count: Arc::new(tokio::sync::Mutex::new(0)),
+            request_sequence: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             order_post_500_remaining: Arc::new(tokio::sync::Mutex::new(0)),
             order_post_malformed_remaining: Arc::new(tokio::sync::Mutex::new(0)),
             batch_order_response: Arc::new(tokio::sync::Mutex::new(None)),
@@ -199,6 +210,8 @@ fn create_test_exec_config_with_retries(
         // production backoff (defaults are 1000ms / 10000ms).
         retry_delay_initial_ms: 1,
         retry_delay_max_ms: 10,
+        signing_account_id: Some(42),
+        signing_profile_id: Some("account:42:polymarket".to_string()),
         ..PolymarketExecClientConfig::default()
     }
 }
@@ -300,6 +313,7 @@ async fn handle_get_orders(State(state): State<TestServerState>) -> Response {
 
 async fn handle_get_order(State(state): State<TestServerState>) -> Response {
     *state.last_path.lock().await = "/data/order".to_string();
+    state.request_sequence.lock().await.push("GET");
     let resp = state.single_order_response.lock().await;
     match resp.as_ref() {
         Some(v) => Json(v.clone()).into_response(),
@@ -335,6 +349,7 @@ async fn handle_post_order(
         .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
     *state.order_post_count.lock().await += 1;
+    state.request_sequence.lock().await.push("POST");
 
     if let Ok(v) = serde_json::from_slice::<Value>(&body) {
         state.order_bodies.lock().await.push(v.clone());
@@ -626,16 +641,17 @@ async fn test_exec_client_poly1271_uses_signer_for_api_auth() {
 
     client.query_account(cmd).unwrap();
 
-    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { state.last_path.lock().await.as_str() == "/balance-allowance" }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
     let headers = state.last_headers.lock().await;
 
-    assert!(
-        matches!(event, ExecutionEvent::Account(_)),
-        "Expected Account event, was {event:?}"
-    );
+    assert!(rx.try_recv().is_err());
     assert_eq!(
         headers.get("poly_address").map(String::as_str),
         Some(TEST_SIGNER_ADDRESS),
@@ -1295,8 +1311,10 @@ async fn test_generate_account_state_emits_event() {
         .generate_account_state(balances, vec![], true, UnixNanos::default())
         .unwrap();
 
-    let event = rx.try_recv().unwrap();
-    assert!(matches!(event, ExecutionEvent::Account(_)));
+    // Account state publication travels through the message bus rather than
+    // the execution-runner event channel. The direct API contract is that the
+    // call succeeds without fabricating an execution report.
+    assert!(rx.try_recv().is_err());
 }
 
 #[rstest]
@@ -1990,13 +2008,13 @@ fn assert_order_status_report(event: ExecutionEvent, expected_status: OrderStatu
 }
 
 #[rstest]
-#[case("UNMATCHED", "Rejected")]
-#[case("CANCELED", "Canceled")]
-#[case("CANCELED_MARKET_RESOLVED", "Expired")]
+#[case("UNMATCHED", OrderStatus::Rejected)]
+#[case("CANCELED", OrderStatus::Canceled)]
+#[case("CANCELED_MARKET_RESOLVED", OrderStatus::Expired)]
 #[tokio::test]
 async fn test_fok_deferred_check_emits_terminal_event(
     #[case] venue_status: &str,
-    #[case] expected_event: &str,
+    #[case] expected_status: OrderStatus,
 ) {
     let state = TestServerState::default();
     // REST resolves the unfilled FOK order to a terminal status for the deferred check.
@@ -2060,14 +2078,14 @@ async fn test_fok_deferred_check_emits_terminal_event(
         .unwrap();
     assert_order_event(event, "Accepted");
 
-    // Deferred FOK check: after ~5s, the own order resolves via REST to a terminal state and
-    // emits the matching order event (the order was submitted through this client, so it is
-    // tracked).
+    // Deferred FOK REST state is projected as an authoritative report. This
+    // preserves exact cumulative fill/status data without fabricating a WS
+    // lifecycle event.
     let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
         .await
         .unwrap()
         .unwrap();
-    assert_order_event(event, expected_event);
+    assert_order_status_report(event, expected_status);
 }
 
 /// A FOK order the venue reports as MATCHED but for which no fills reached the tracker (the live
@@ -2236,6 +2254,40 @@ fn make_limit_order(
         UUID4::new(),
         UnixNanos::default(),
     ))
+}
+
+fn recovered_prepared_limit_order(client_order_id: &str) -> PreparedPolymarketOrder {
+    let key = EvmPrivateKey::new(TEST_PRIVATE_KEY).unwrap();
+    let signer = OrderSigner::new(&key).unwrap();
+    let address = format!("{:#x}", signer.address());
+    let builder = PolymarketOrderBuilder::new(
+        Arc::new(signer),
+        address.clone(),
+        address,
+        SignatureType::Eoa,
+    );
+    PreparedPolymarketOrder::prepare(
+        &builder,
+        PreparedOrderRequest {
+            client_order_id: client_order_id.to_string(),
+            account_id: "42".to_string(),
+            profile_id: "account:42:polymarket".to_string(),
+            kind: PreparedOrderKind::Limit,
+            token_id:
+                "71321045679252212594626385532706912750332728571942532289631379312455583992563"
+                    .to_string(),
+            side: OrderSide::Buy,
+            price: dec!(0.50),
+            amount: dec!(10),
+            quote_quantity: false,
+            time_in_force: TimeInForce::Gtc,
+            post_only: false,
+            neg_risk: false,
+            tick_decimals: 4,
+            expiration: "0".to_string(),
+        },
+    )
+    .unwrap()
 }
 
 fn make_submit_cmd(order: &OrderAny, instrument_id: InstrumentId) -> SubmitOrder {
@@ -2732,6 +2784,78 @@ async fn test_submit_order_http_5xx_submit_outcome_unknown() {
     )
     .await;
     assert_no_execution_event(&mut rx).await;
+}
+
+#[rstest]
+#[case(
+    "strategy:recovery-filled:stop:entry",
+    "MATCHED",
+    "10",
+    OrderStatus::Filled
+)]
+#[case(
+    "strategy:recovery-cancelled:stop:entry",
+    "CANCELED",
+    "3",
+    OrderStatus::Canceled
+)]
+#[tokio::test]
+async fn test_restored_prepared_order_gets_and_projects_terminal_before_any_post(
+    #[case] client_order_id: &str,
+    #[case] venue_status: &str,
+    #[case] size_matched: &str,
+    #[case] expected_status: OrderStatus,
+) {
+    let state = TestServerState::default();
+    let prepared = recovered_prepared_limit_order(client_order_id);
+    let expected_order_id = prepared.expected_venue_order_id.clone();
+    let mut found = load_json("http_open_order.json");
+    found["id"] = json!(expected_order_id);
+    found["status"] = json!(venue_status);
+    found["original_size"] = json!("10");
+    found["size_matched"] = json!(size_matched);
+    *state.single_order_response.lock().await = Some(found);
+
+    // Exercise the actual durable restore boundary: the runtime-only marker is
+    // absent from serialized state and is set explicitly by recovery.
+    let restored: PreparedPolymarketOrder =
+        serde_json::from_value(serde_json::to_value(prepared).unwrap()).unwrap();
+    register_recovered_prepared_order(restored).unwrap();
+
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache(&cache, instrument_id);
+    let order = make_limit_order(
+        client_order_id,
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+
+    client
+        .submit_order(make_submit_cmd(&order, instrument_id))
+        .unwrap();
+    assert_order_event(recv_execution_event(&mut rx).await, "Submitted");
+    assert_order_event(recv_execution_event(&mut rx).await, "Accepted");
+    if expected_status == OrderStatus::Canceled && size_matched != "0" {
+        assert_order_status_report(
+            recv_execution_event(&mut rx).await,
+            OrderStatus::PartiallyFilled,
+        );
+    }
+    assert_order_status_report(recv_execution_event(&mut rx).await, expected_status);
+
+    assert_eq!(*state.order_post_count.lock().await, 0);
+    assert_eq!(*state.request_sequence.lock().await, vec!["GET"]);
 }
 
 #[rstest]
@@ -3868,6 +3992,7 @@ async fn test_cancel_order_success_no_rejection_event() {
         Duration::from_secs(5),
     )
     .await;
+    assert_order_event(recv_execution_event(&mut rx).await, "Canceled");
     assert_no_execution_event(&mut rx).await;
 }
 
@@ -4123,10 +4248,11 @@ async fn test_batch_cancel_orders_with_partial_failure() {
 
     client.batch_cancel_orders(cmd).unwrap();
 
-    // Order 3 has CANCEL_ALREADY_DONE, so it should be suppressed.
-    // No CancelRejected events expected.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(rx.try_recv().is_err());
+    // Successful members project cancellation immediately; order 3 has
+    // CANCEL_ALREADY_DONE and is suppressed without CancelRejected.
+    assert_order_event(recv_execution_event(&mut rx).await, "Canceled");
+    assert_order_event(recv_execution_event(&mut rx).await, "Canceled");
+    assert_no_execution_event(&mut rx).await;
 }
 
 #[rstest]
@@ -4288,6 +4414,7 @@ async fn test_cancel_order_deferred_when_no_venue_order_id() {
         Duration::from_secs(5),
     )
     .await;
+    assert_order_event(recv_execution_event(&mut rx).await, "Canceled");
     assert_no_execution_event(&mut rx).await;
 }
 
@@ -4623,7 +4750,7 @@ async fn test_query_order_does_not_block_within_runtime() {
 #[tokio::test]
 async fn test_query_account_does_not_block_within_runtime() {
     let state = TestServerState::default();
-    let addr = start_mock_server(state).await;
+    let addr = start_mock_server(state.clone()).await;
     let (mut client, mut rx, _cache) = create_test_execution_client(addr);
     client.start().unwrap();
 
@@ -4640,12 +4767,13 @@ async fn test_query_account_does_not_block_within_runtime() {
     // This must not panic with "Cannot start a runtime from within a runtime"
     client.query_account(cmd).unwrap();
 
-    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        matches!(event, ExecutionEvent::Account(_)),
-        "Expected Account event, was {event:?}"
-    );
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { state.last_path.lock().await.as_str() == "/balance-allowance" }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(rx.try_recv().is_err());
 }

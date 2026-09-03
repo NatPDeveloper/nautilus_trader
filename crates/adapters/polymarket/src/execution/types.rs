@@ -69,6 +69,9 @@ pub(crate) struct SignedLimitOrderSubmission {
     /// True when the exact envelope is durably persisted by the caller and
     /// may therefore be reconciled/reposted without a new signature.
     pub(crate) prepared: bool,
+    /// True when this durable envelope was restored after a process restart,
+    /// requiring an exact GET before its first POST.
+    pub(crate) reconcile_before_post: bool,
 }
 
 #[derive(Clone, Debug)]

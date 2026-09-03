@@ -66,6 +66,10 @@ pub struct PreparedPolymarketOrder {
     pub expected_venue_order_id: String,
     pub expected_base_quantity: Decimal,
     pub fingerprint: String,
+    /// Runtime-only recovery marker. Restored durable envelopes must reconcile
+    /// their exact signed hash before the first POST after process restart.
+    #[serde(skip, default)]
+    pub(crate) reconcile_before_post: bool,
 }
 
 impl PreparedPolymarketOrder {
@@ -119,6 +123,7 @@ impl PreparedPolymarketOrder {
             expected_venue_order_id,
             expected_base_quantity,
             fingerprint,
+            reconcile_before_post: false,
         })
     }
 
@@ -143,13 +148,31 @@ impl PreparedPolymarketOrder {
 }
 
 pub fn register_prepared_order(prepared: PreparedPolymarketOrder) -> anyhow::Result<()> {
+    register_prepared_order_with_recovery(prepared, false)
+}
+
+/// Registers an envelope restored from durable strategy state.
+///
+/// Unlike a newly prepared envelope, a restored envelope may already have
+/// reached the venue before the previous process crashed. Its first submit in
+/// this process must therefore exact-query the signed hash before any repost.
+pub fn register_recovered_prepared_order(prepared: PreparedPolymarketOrder) -> anyhow::Result<()> {
+    register_prepared_order_with_recovery(prepared, true)
+}
+
+fn register_prepared_order_with_recovery(
+    mut prepared: PreparedPolymarketOrder,
+    recovered: bool,
+) -> anyhow::Result<()> {
     prepared.validate()?;
+    prepared.reconcile_before_post |= recovered;
     let id = prepared.request.client_order_id.clone();
     let mut registry = PREPARED
         .lock()
         .map_err(|_| anyhow::anyhow!("prepared order registry poisoned"))?;
-    if let Some(existing) = registry.get(&id) {
+    if let Some(existing) = registry.get_mut(&id) {
         if existing.fingerprint == prepared.fingerprint {
+            existing.reconcile_before_post |= prepared.reconcile_before_post;
             return Ok(());
         }
         anyhow::bail!("prepared order identity conflict for {id}");

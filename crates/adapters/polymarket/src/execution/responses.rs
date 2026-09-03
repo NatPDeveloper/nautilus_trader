@@ -804,6 +804,31 @@ async fn check_terminal_status_with_backoff(
 }
 
 #[expect(clippy::too_many_arguments)]
+pub(super) fn project_reconciled_order_status(
+    venue_order: &PolymarketOpenOrder,
+    order: &OrderAny,
+    emitter: &ExecutionEventEmitter,
+    account_id: AccountId,
+    size_precision: u8,
+    price_precision: u8,
+    clock: &'static AtomicTime,
+) {
+    let status = OrderStatus::from(venue_order.status);
+    send_terminal_confirmation_report(
+        emitter,
+        build_rest_confirmation_report(
+            venue_order,
+            order,
+            account_id,
+            status,
+            size_precision,
+            price_precision,
+            clock.get_time_ns(),
+        ),
+    );
+}
+
+#[expect(clippy::too_many_arguments)]
 pub(super) fn send_terminal_confirmation_report(
     emitter: &ExecutionEventEmitter,
     report: OrderStatusReport,
@@ -1455,6 +1480,7 @@ mod tests {
             success: true,
             order_id: Some(venue_order_id.to_string()),
             error_msg: None,
+            reconciled_order: None,
         };
         assert!(
             handle_order_response(
@@ -1546,6 +1572,7 @@ mod tests {
             success: true,
             order_id: Some(venue_order_id.to_string()),
             error_msg: None,
+            reconciled_order: None,
         };
         assert!(
             handle_order_response(
@@ -1655,6 +1682,7 @@ mod tests {
             success: true,
             order_id: Some(venue_order_id.to_string()),
             error_msg: None,
+            reconciled_order: None,
         };
         handle_order_response(
             Ok(response),
@@ -1716,6 +1744,7 @@ mod tests {
             success: true,
             order_id: Some(String::new()),
             error_msg: None,
+            reconciled_order: None,
         };
 
         assert!(
@@ -1759,6 +1788,7 @@ mod tests {
             success: true,
             order_id: Some(String::new()),
             error_msg: Some(reason.to_string()),
+            reconciled_order: None,
         };
 
         assert!(
@@ -1807,6 +1837,7 @@ mod tests {
             success: false,
             order_id: None,
             error_msg: Some(reason.to_string()),
+            reconciled_order: None,
         };
 
         assert!(

@@ -25,7 +25,7 @@ use crate::{
         enums::{PolymarketOrderType, SignatureType},
         parse::{deserialize_decimal_from_str, deserialize_optional_decimal_from_str},
     },
-    http::models::PolymarketOrder,
+    http::models::{PolymarketOpenOrder, PolymarketOrder},
 };
 
 /// Query parameters for `GET /data/orders`.
@@ -109,6 +109,11 @@ pub struct OrderResponse {
     pub order_id: Option<String>,
     #[serde(rename = "errorMsg")]
     pub error_msg: Option<String>,
+    /// Exact REST state discovered while reconciling an ambiguous/recovered
+    /// submission. This is runtime-only and is projected by the normal
+    /// execution lifecycle instead of inventing a generic acceptance.
+    #[serde(skip, default)]
+    pub reconciled_order: Option<PolymarketOpenOrder>,
 }
 
 /// Cancel response from all cancel endpoints (`DELETE /order`, `/orders`,

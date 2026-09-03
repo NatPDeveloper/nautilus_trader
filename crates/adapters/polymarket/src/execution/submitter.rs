@@ -273,6 +273,7 @@ impl OrderSubmitter {
                 false,
                 expected_venue_order_id,
                 false,
+                false,
             )
             .await
         {
@@ -302,6 +303,7 @@ impl OrderSubmitter {
         let expected_venue_order_id = VenueOrderId::from(prepared.expected_venue_order_id.as_str());
         let expected_base_qty = prepared.expected_base_quantity;
         let order_type = prepared.order_type;
+        let reconcile_before_post = prepared.reconcile_before_post;
         let poly_order = prepared.order;
         let response = match self
             .post_order_with_retry(
@@ -311,6 +313,7 @@ impl OrderSubmitter {
                 false,
                 expected_venue_order_id,
                 true,
+                reconcile_before_post,
             )
             .await
         {
@@ -447,6 +450,7 @@ impl OrderSubmitter {
                     prepared.expected_venue_order_id.as_str(),
                 ),
                 prepared: true,
+                reconcile_before_post: prepared.reconcile_before_post,
             });
         }
         if requires_prepared_order(&prepared_request.client_order_id) {
@@ -480,6 +484,7 @@ impl OrderSubmitter {
             post_only: request.post_only,
             expected_venue_order_id,
             prepared: false,
+            reconcile_before_post: false,
         })
     }
 
@@ -494,6 +499,7 @@ impl OrderSubmitter {
             submission.post_only,
             submission.expected_venue_order_id,
             submission.prepared,
+            submission.reconcile_before_post,
         )
         .await
     }
@@ -509,10 +515,11 @@ impl OrderSubmitter {
         post_only: bool,
         expected_venue_order_id: VenueOrderId,
         durable: bool,
+        recovered: bool,
     ) -> crate::http::error::Result<OrderResponse> {
         let http_client = self.http_client.clone();
         let ambiguous_reason = Arc::new(Mutex::new(None::<String>));
-        let reconcile_before_post = Arc::new(AtomicBool::new(false));
+        let reconcile_before_post = Arc::new(AtomicBool::new(durable && recovered));
         let taint = Arc::clone(&ambiguous_reason);
         let reconcile = Arc::clone(&reconcile_before_post);
         let cancelled_submissions = Arc::clone(&self.cancelled_submissions);
@@ -548,6 +555,7 @@ impl OrderSubmitter {
                                         success: true,
                                         order_id: Some(expected_venue_order_id.to_string()),
                                         error_msg: None,
+                                        reconciled_order: Some(found),
                                     });
                                 }
                                 Ok(Some(found)) => {
